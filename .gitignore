@@ -1,0 +1,33 @@
+# Dependencies
+node_modules/
+
+# Build outputs
+.next/
+www/
+dist/
+
+# Local database files
+*.db
+*.db-shm
+*.db-wal
+
+# OS / editor
+.DS_Store
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# Logs
+*.log
+
+# Temporary files
+tmp/
+temp/
+
+# Caddy
+Caddyfile
+
+# Test artifacts
+test.txt
