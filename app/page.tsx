@@ -112,8 +112,8 @@ export default function Home() {
 
   useEffect(() => {
     initDb()
-      .then(() => {
-        const data = getAllItems();
+      .then(() => getAllItems())
+      .then((data) => {
         setItems(data);
         setLoading(false);
       })
@@ -124,9 +124,10 @@ export default function Home() {
       });
   }, []);
 
-  const refresh = () => {
+  const refresh = async () => {
     try {
-      setItems(getAllItems());
+      const data = await getAllItems();
+      setItems(data);
     } catch (e: any) {
       setError(String(e));
     }
