@@ -29,5 +29,8 @@ temp/
 # Caddy
 Caddyfile
 
+# Pi GSD
+.pi/
+
 # Test artifacts
 test.txt
