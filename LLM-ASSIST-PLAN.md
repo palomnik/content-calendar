@@ -22,6 +22,7 @@ Two complementary surfaces, both optional and non-intrusive:
    has the full record as context.
 2. **Per-card quick action (stretch goal).** A small ✨ icon on Kanban cards that
    deep-links into the same panel for that record.
+3. **A Generate Ideas** form (launched from button at top) that takes input on lead avatar and product to be highlighted, that creates 5-10 records in the "Brainstormed" status.   
 
 The panel is a chat thread: message history on top, an input box at the bottom,
 and a row of **status-specific suggested prompts** ("quick actions") above the
