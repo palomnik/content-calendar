@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState, useCallback } from "react";
+import Link from "next/link";
 import {
   initDb,
   getAllItems,
@@ -51,6 +52,14 @@ const STATUSES = [
   "In Review",
   "Scheduled",
   "Published",
+];
+
+type View = "kanban" | "date" | "status";
+
+const VIEWS: { value: View; label: string }[] = [
+  { value: "kanban", label: "Kanban View" },
+  { value: "date", label: "Date" },
+  { value: "status", label: "Status" },
 ];
 
 const EMPTY_FORM = {
@@ -145,6 +154,68 @@ function ColumnSkeleton() {
   );
 }
 
+/* ─────────────── List views (Date / Status) ─────────────── */
+
+function EmptyState() {
+  return (
+    <div className="flex flex-col items-center justify-center rounded-xl border border-dashed border-[var(--border)] py-16 text-center">
+      <span className="mb-2 text-3xl">📭</span>
+      <p className="text-sm text-[var(--muted)]">No items to show</p>
+    </div>
+  );
+}
+
+function ListGroup({
+  heading,
+  records,
+  onOpen,
+  dot,
+}: {
+  heading: string;
+  records: ContentItem[];
+  onOpen: (item: ContentItem) => void;
+  dot?: string;
+}) {
+  return (
+    <section className="mb-8">
+      <div className="mb-2 flex items-center gap-2 border-b border-[var(--border)] pb-1.5">
+        {dot && <span className={`h-2 w-2 rounded-full ${dot}`}></span>}
+        <h2 className="text-sm font-semibold uppercase tracking-wider text-[var(--muted)]">
+          {heading}
+        </h2>
+        <span className="rounded-full bg-[var(--surface)] px-2 py-0.5 text-xs font-medium text-[var(--muted)]">
+          {records.length}
+        </span>
+      </div>
+      <ul className="divide-y divide-[var(--border)]">
+        {records.map((item) => (
+          <li key={item.id}>
+            <button
+              onClick={() => onOpen(item)}
+              className="flex w-full items-center gap-3 py-2 text-left transition hover:bg-[var(--surface)]"
+            >
+              <span className="flex-1 truncate text-sm font-medium text-[var(--foreground)]">
+                {item.headline}
+              </span>
+              {item.format && (
+                <span className="hidden shrink-0 rounded bg-[var(--surface)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--muted)] sm:inline">
+                  {item.format}
+                </span>
+              )}
+              {item.writer && (
+                <span className="hidden shrink-0 text-xs text-[var(--muted)] sm:inline">
+                  ✍ {item.writer}
+                </span>
+              )}
+              <span className="shrink-0 text-xs text-[var(--muted)]">{item.contentStatus}</span>
+            </button>
+          </li>
+        ))}
+      </ul>
+    </section>
+  );
+}
+
 /* ─────────────── Main Page ─────────────── */
 
 export default function Home() {
@@ -165,6 +236,7 @@ export default function Home() {
   const [showImport, setShowImport] = useState(false);
   const [search, setSearch] = useState("");
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+  const [view, setView] = useState<View>("kanban");
 
   useEffect(() => {
     initDb()
@@ -334,6 +406,44 @@ export default function Home() {
   const byStatus = (status: string) =>
     filtered.filter((i) => i.contentStatus === status);
 
+  const formatDateLabel = (iso: string) =>
+    new Date(iso).toLocaleDateString("en-US", {
+      weekday: "long",
+      year: "numeric",
+      month: "long",
+      day: "numeric",
+      timeZone: "UTC",
+    });
+
+  // Date view: group by due date. Only dates with records appear. Records
+  // without a due date collapse into a single trailing "No due date" group.
+  const dateGroups = (() => {
+    const map = new Map<string, ContentItem[]>();
+    const undated: ContentItem[] = [];
+    for (const item of filtered) {
+      const key = item.dueDate ? item.dueDate.slice(0, 10) : null;
+      if (key === null) {
+        undated.push(item);
+      } else {
+        if (!map.has(key)) map.set(key, []);
+        map.get(key)!.push(item);
+      }
+    }
+    const groups = Array.from(map.entries())
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([date, records]) => ({ label: formatDateLabel(date), records }));
+    if (undated.length) groups.push({ label: "No due date", records: undated });
+    return groups;
+  })();
+
+  // Status view: group by status in workflow order. Only statuses with
+  // records appear.
+  const statusGroups = STATUSES.map((status) => ({
+    label: status,
+    records: byStatus(status),
+    dot: (STATUS_COLORS[status] || STATUS_COLORS.Brainstormed).dot,
+  })).filter((g) => g.records.length > 0);
+
   const inputClass =
     "w-full rounded-md border border-[var(--border)] bg-[var(--background)] px-3 py-2 text-sm text-[var(--foreground)] placeholder:text-[var(--muted)] transition focus:border-[var(--accent)] focus:outline-none focus:ring-1 focus:ring-[var(--accent)]";
 
@@ -430,8 +540,35 @@ export default function Home() {
             <span className="hidden md:inline">+ Add Item</span>
             <span className="md:hidden">+</span>
           </button>
+          <Link
+            href="/settings"
+            className="rounded-lg border border-[var(--border)] px-2.5 py-2 text-sm font-medium text-[var(--foreground)] transition hover:bg-[var(--surface)] active:bg-[var(--surface-hover)] md:px-3"
+            title="Settings"
+          >
+            <span aria-hidden>⚙</span>
+            <span className="sr-only">Settings</span>
+          </Link>
         </div>
       </header>
+
+      {/* ── View selector ── */}
+      <div className="flex items-center gap-2 border-b border-[var(--border)] px-4 py-2 md:px-6">
+        <div className="inline-flex rounded-lg border border-[var(--border)] bg-[var(--surface)] p-0.5">
+          {VIEWS.map((v) => (
+            <button
+              key={v.value}
+              onClick={() => setView(v.value)}
+              className={`rounded-md px-3 py-1.5 text-sm font-medium transition ${
+                view === v.value
+                  ? "bg-[var(--background)] text-[var(--foreground)] shadow-sm"
+                  : "text-[var(--muted)] hover:text-[var(--foreground)]"
+              }`}
+            >
+              {v.label}
+            </button>
+          ))}
+        </div>
+      </div>
 
       {/* ── Mobile search bar ── */}
       <div className="border-b border-[var(--border)] px-4 py-2 md:hidden">
@@ -445,6 +582,7 @@ export default function Home() {
       </div>
 
       {/* ── Kanban Board ── */}
+      {view === "kanban" && (
       <main className="flex-1 overflow-x-auto overflow-y-hidden p-4 md:p-6">
         <div className="flex min-w-max gap-4">
           {STATUSES.map((status) => {
@@ -545,6 +683,48 @@ export default function Home() {
           })}
         </div>
       </main>
+      )}
+
+      {/* ── Date View ── */}
+      {view === "date" && (
+        <main className="flex-1 overflow-y-auto p-4 md:p-6">
+          <div className="mx-auto max-w-3xl">
+            {dateGroups.length === 0 ? (
+              <EmptyState />
+            ) : (
+              dateGroups.map((group) => (
+                <ListGroup
+                  key={group.label}
+                  heading={group.label}
+                  records={group.records}
+                  onOpen={openEdit}
+                />
+              ))
+            )}
+          </div>
+        </main>
+      )}
+
+      {/* ── Status View ── */}
+      {view === "status" && (
+        <main className="flex-1 overflow-y-auto p-4 md:p-6">
+          <div className="mx-auto max-w-3xl">
+            {statusGroups.length === 0 ? (
+              <EmptyState />
+            ) : (
+              statusGroups.map((group) => (
+                <ListGroup
+                  key={group.label}
+                  heading={group.label}
+                  dot={group.dot}
+                  records={group.records}
+                  onOpen={openEdit}
+                />
+              ))
+            )}
+          </div>
+        </main>
+      )}
 
       {/* ── Toasts ── */}
       <div className="pointer-events-none fixed right-4 top-4 z-[100] flex max-w-xs flex-col gap-2">

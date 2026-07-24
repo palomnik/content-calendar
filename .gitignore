@@ -11,6 +11,9 @@ dist/
 *.db-shm
 *.db-wal
 
+# Runtime DB configuration (may contain external DB credentials)
+data/db-config.json
+
 # OS / editor
 .DS_Store
 *.swp

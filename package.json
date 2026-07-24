@@ -11,7 +11,9 @@
   },
   "dependencies": {
     "better-sqlite3": "^12.10.0",
+    "mysql2": "^3.23.1",
     "next": "^15.5.19",
+    "pg": "^8.22.0",
     "react": "^19.2.7",
     "react-dom": "^19.2.7"
   },
@@ -20,6 +22,7 @@
     "@tailwindcss/postcss": "^4",
     "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^20",
+    "@types/pg": "^8.20.0",
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "eslint": "^9",
