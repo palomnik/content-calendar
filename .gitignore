@@ -5,6 +5,7 @@ node_modules/
 .next/
 www/
 dist/
+tsconfig.tsbuildinfo
 
 # Local database files
 *.db
