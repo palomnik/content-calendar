@@ -1,12 +1,16 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getItem, updateItem, deleteItem } from "../../../lib/db";
+import { requireUser } from "../../../lib/auth";
 
 // GET /api/items/[id] — get single item
 export async function GET(
-  _req: NextRequest,
+  req: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
+    const auth = await requireUser(req);
+    if (auth.error) return auth.error;
+
     const { id } = await params;
     const item = await getItem(id);
     if (!item) {
@@ -24,6 +28,9 @@ export async function PATCH(
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
+    const auth = await requireUser(req);
+    if (auth.error) return auth.error;
+
     const { id } = await params;
     const data = await req.json();
     const item = await updateItem(id, data);
@@ -38,10 +45,13 @@ export async function PATCH(
 
 // DELETE /api/items/[id] — delete item
 export async function DELETE(
-  _req: NextRequest,
+  req: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
+    const auth = await requireUser(req);
+    if (auth.error) return auth.error;
+
     const { id } = await params;
     const ok = await deleteItem(id);
     if (!ok) {

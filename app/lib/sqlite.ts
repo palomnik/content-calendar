@@ -1,11 +1,19 @@
 // Client-side data layer — talks to server API routes
 // All data persists in the server-side SQLite database (content_calendar.db)
 
+import { redirectToLogin } from "./useAuth";
+
 const API_BASE = "/api";
 
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${API_BASE}${path}`, init);
   if (!res.ok) {
+    // Session expired or revoked mid-session — send them back to sign in
+    // rather than surfacing a confusing error in the UI.
+    if (res.status === 401) {
+      redirectToLogin();
+      throw new Error("Your session has expired. Redirecting to sign in…");
+    }
     const err = await res.json().catch(() => ({ error: res.statusText }));
     throw new Error(err.error || `${res.status} ${res.statusText}`);
   }

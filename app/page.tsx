@@ -12,6 +12,7 @@ import {
   parseCsv,
   browserDownload,
 } from "./lib/sqlite";
+import { signOut, useAuth } from "./lib/useAuth";
 
 interface ContentItem {
   id: string;
@@ -219,6 +220,7 @@ function ListGroup({
 /* ─────────────── Main Page ─────────────── */
 
 export default function Home() {
+  const { user } = useAuth();
   const [items, setItems] = useState<ContentItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -548,6 +550,27 @@ export default function Home() {
             <span aria-hidden>⚙</span>
             <span className="sr-only">Settings</span>
           </Link>
+          {user && (
+            <div className="flex items-center gap-2 border-l border-[var(--border)] pl-2 md:pl-3">
+              <span
+                className="hidden text-sm text-[var(--muted)] lg:inline"
+                title={`Signed in as ${user.username}`}
+              >
+                {user.displayName || user.username}
+              </span>
+              <button
+                onClick={() => signOut()}
+                className="rounded-lg border border-[var(--border)] px-2.5 py-2 text-sm font-medium text-[var(--foreground)] transition hover:bg-[var(--surface)] active:bg-[var(--surface-hover)] md:px-3"
+                title="Sign out"
+              >
+                <span className="hidden md:inline">Sign out</span>
+                <span className="md:hidden" aria-hidden>
+                  ⏻
+                </span>
+                <span className="sr-only md:hidden">Sign out</span>
+              </button>
+            </div>
+          )}
         </div>
       </header>
 

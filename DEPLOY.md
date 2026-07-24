@@ -1,5 +1,46 @@
 # Deployment Guide: Content Calendar
 
+## Authentication
+
+The app requires a sign-in. Every page and API route is protected; the only
+public endpoints are the login page and the auth endpoints backing it.
+
+### First run
+
+On a database with no accounts, `/login` shows a **create administrator** form
+instead of a sign-in form. The first person to submit it becomes the admin, and
+the endpoint closes permanently after that.
+
+Because a freshly deployed, publicly reachable instance is claimable by whoever
+loads it first, set `SETUP_TOKEN` before exposing it:
+
+```bash
+SETUP_TOKEN="$(openssl rand -hex 24)"
+```
+
+When `SETUP_TOKEN` is set, the setup form also asks for that value. It is only
+consulted while zero accounts exist and can be removed afterwards.
+
+### Accounts follow the database
+
+Users and sessions live in the **active database** (`users` and `sessions`
+tables), alongside `content_items`. Switching providers in `/settings` switches
+the account store too — the new database will prompt for admin setup if it has
+no users. All three tables are created automatically.
+
+### Cookies and HTTPS
+
+Session cookies are `httpOnly` + `sameSite=lax`, and are marked `secure` when
+`NODE_ENV=production` — so a production deployment **must** be served over
+HTTPS or browsers will drop the cookie and logins will appear to silently fail.
+
+### Recovering a lost admin password
+
+There is no email reset. Another administrator can reset the password from
+`/settings`. If every admin password is lost, delete the rows from the `users`
+table in the active database (e.g. `DELETE FROM users;`) and reload `/login` —
+the app returns to first-run setup. Content items are unaffected.
+
 ## Build verification (local)
 
 ```bash

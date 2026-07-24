@@ -7,6 +7,7 @@ import {
   testConfig,
   writeConfig,
 } from "../../lib/db";
+import { requireAdmin } from "../../lib/auth";
 
 const PROVIDERS: Provider[] = ["sqlite", "mysql", "mariadb", "postgres"];
 
@@ -50,19 +51,26 @@ function normalize(body: any): DbConfig {
   };
 }
 
-// GET /api/config — current configuration (password redacted)
-export async function GET() {
+// GET /api/config — current configuration (password redacted). Admin only:
+// the connection details name internal hosts and users.
+export async function GET(req: NextRequest) {
   try {
+    const auth = await requireAdmin(req);
+    if (auth.error) return auth.error;
+
     return NextResponse.json(publicConfig());
   } catch (e: any) {
     return NextResponse.json({ error: e.message }, { status: 500 });
   }
 }
 
-// POST /api/config — test and save a configuration.
+// POST /api/config — test and save a configuration. Admin only.
 // Body may include { test: true } to validate without persisting.
 export async function POST(req: NextRequest) {
   try {
+    const auth = await requireAdmin(req);
+    if (auth.error) return auth.error;
+
     const body = await req.json();
     const config = normalize(body);
 

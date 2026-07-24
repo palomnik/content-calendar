@@ -126,13 +126,19 @@ interface Adapter {
   run(sql: string, params: any[], select: boolean): Promise<any[]>;
 }
 
-function ddl(provider: Provider): string {
+// Each statement is executed separately — MySQL/Postgres drivers reject
+// multi-statement strings by default.
+function ddlStatements(provider: Provider): string[] {
   // word_count is the only non-text column; everything else is TEXT so the
   // shape stays identical across engines.
   const intType = "INTEGER";
   const idType = provider === "sqlite" ? "TEXT" : "VARCHAR(64)";
   const shortType = provider === "sqlite" ? "TEXT" : "VARCHAR(64)";
-  return `
+  // Usernames are indexed UNIQUE; MySQL needs a bounded length for that.
+  const nameType = provider === "sqlite" ? "TEXT" : "VARCHAR(190)";
+
+  return [
+    `
     CREATE TABLE IF NOT EXISTS content_items (
       id ${idType} PRIMARY KEY,
       created_at ${shortType},
@@ -155,7 +161,27 @@ function ddl(provider: Provider): string {
       gdrive_link TEXT,
       notes TEXT
     )
-  `;
+  `,
+    `
+    CREATE TABLE IF NOT EXISTS users (
+      id ${idType} PRIMARY KEY,
+      created_at ${shortType},
+      updated_at ${shortType},
+      username ${nameType} NOT NULL UNIQUE,
+      display_name TEXT,
+      password_hash TEXT NOT NULL,
+      role ${shortType} NOT NULL
+    )
+  `,
+    `
+    CREATE TABLE IF NOT EXISTS sessions (
+      id ${idType} PRIMARY KEY,
+      user_id ${idType} NOT NULL,
+      created_at ${shortType},
+      expires_at ${shortType}
+    )
+  `,
+  ];
 }
 
 /* ---- SQLite (better-sqlite3, synchronous) ---- */
@@ -168,7 +194,7 @@ class SqliteAdapter implements Adapter {
     const Database = require("better-sqlite3");
     this.db = new Database(SQLITE_PATH);
     this.db.pragma("journal_mode = WAL");
-    this.db.exec(ddl("sqlite"));
+    for (const stmt of ddlStatements("sqlite")) this.db.exec(stmt);
   }
 
   async run(sql: string, params: any[], select: boolean) {
@@ -198,7 +224,7 @@ class MysqlAdapter implements Adapter {
       waitForConnections: true,
       connectionLimit: 5,
     });
-    await this.pool.query(ddl("mysql"));
+    for (const stmt of ddlStatements("mysql")) await this.pool.query(stmt);
   }
 
   async run(sql: string, params: any[], select: boolean) {
@@ -225,7 +251,7 @@ class PostgresAdapter implements Adapter {
       database: this.conn.database,
       max: 5,
     });
-    await this.pool.query(ddl("postgres"));
+    for (const stmt of ddlStatements("postgres")) await this.pool.query(stmt);
   }
 
   // Rewrite `?` placeholders to `$1, $2, …`.
@@ -356,6 +382,218 @@ export async function deleteItem(id: string): Promise<boolean> {
   if (!existing) return false;
   await db.run("DELETE FROM content_items WHERE id = ?", [id], false);
   return true;
+}
+
+/* ─────────────── Users ─────────────── */
+
+// Accounts live in the *active* database, alongside content_items. Switching
+// providers therefore switches account stores too (see /settings for the
+// warning shown to admins).
+
+export type Role = "admin" | "user";
+
+export interface UserRow {
+  id: string;
+  username: string;
+  displayName: string | null;
+  role: Role;
+  createdAt: string | null;
+  updatedAt: string | null;
+}
+
+export interface UserWithHash extends UserRow {
+  passwordHash: string;
+}
+
+// Usernames are matched case-insensitively; we store the normalized form.
+export function normalizeUsername(username: string): string {
+  return String(username ?? "").trim().toLowerCase();
+}
+
+function rowToUser(row: any): UserRow {
+  return {
+    id: row.id,
+    username: row.username,
+    displayName: row.display_name ?? null,
+    role: row.role === "admin" ? "admin" : "user",
+    createdAt: row.created_at ?? null,
+    updatedAt: row.updated_at ?? null,
+  };
+}
+
+/** Strip the password hash before anything leaves the server. */
+export function publicUser(user: UserRow | UserWithHash): UserRow {
+  const { passwordHash, ...rest } = user as UserWithHash;
+  return rest;
+}
+
+export async function countUsers(): Promise<number> {
+  const db = await getAdapter();
+  const rows = await db.run("SELECT COUNT(*) AS n FROM users", [], true);
+  // Postgres returns counts as strings; MySQL may return BigInt.
+  return Number(rows[0]?.n ?? rows[0]?.count ?? 0);
+}
+
+export async function listUsers(): Promise<UserRow[]> {
+  const db = await getAdapter();
+  const rows = await db.run(
+    "SELECT * FROM users ORDER BY created_at ASC",
+    [],
+    true
+  );
+  return rows.map(rowToUser);
+}
+
+export async function findUserById(id: string): Promise<UserWithHash | null> {
+  const db = await getAdapter();
+  const rows = await db.run("SELECT * FROM users WHERE id = ?", [id], true);
+  if (!rows[0]) return null;
+  return { ...rowToUser(rows[0]), passwordHash: rows[0].password_hash };
+}
+
+export async function findUserByUsername(
+  username: string
+): Promise<UserWithHash | null> {
+  const db = await getAdapter();
+  const rows = await db.run(
+    "SELECT * FROM users WHERE username = ?",
+    [normalizeUsername(username)],
+    true
+  );
+  if (!rows[0]) return null;
+  return { ...rowToUser(rows[0]), passwordHash: rows[0].password_hash };
+}
+
+export async function insertUser(data: {
+  username: string;
+  passwordHash: string;
+  role: Role;
+  displayName?: string | null;
+}): Promise<UserRow> {
+  const db = await getAdapter();
+  const username = normalizeUsername(data.username);
+
+  if (await findUserByUsername(username)) {
+    throw new Error("That username is already taken.");
+  }
+
+  const id = generateId();
+  const now = new Date().toISOString();
+  await db.run(
+    `INSERT INTO users (id, created_at, updated_at, username, display_name, password_hash, role)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    [id, now, now, username, data.displayName ?? null, data.passwordHash, data.role],
+    false
+  );
+
+  const created = await findUserById(id);
+  if (!created) throw new Error("Failed to create user.");
+  return publicUser(created);
+}
+
+export async function updateUser(
+  id: string,
+  data: { passwordHash?: string; role?: Role; displayName?: string | null }
+): Promise<UserRow | null> {
+  const db = await getAdapter();
+  const existing = await findUserById(id);
+  if (!existing) return null;
+
+  const set: string[] = [];
+  const values: any[] = [];
+  if (data.passwordHash !== undefined) {
+    set.push("password_hash = ?");
+    values.push(data.passwordHash);
+  }
+  if (data.role !== undefined) {
+    set.push("role = ?");
+    values.push(data.role);
+  }
+  if (data.displayName !== undefined) {
+    set.push("display_name = ?");
+    values.push(data.displayName);
+  }
+  if (set.length === 0) return publicUser(existing);
+
+  values.push(new Date().toISOString(), id);
+  await db.run(
+    `UPDATE users SET ${set.join(", ")}, updated_at = ? WHERE id = ?`,
+    values,
+    false
+  );
+
+  const updated = await findUserById(id);
+  return updated ? publicUser(updated) : null;
+}
+
+export async function deleteUser(id: string): Promise<boolean> {
+  const db = await getAdapter();
+  const existing = await findUserById(id);
+  if (!existing) return false;
+  await db.run("DELETE FROM sessions WHERE user_id = ?", [id], false);
+  await db.run("DELETE FROM users WHERE id = ?", [id], false);
+  return true;
+}
+
+export async function countAdmins(): Promise<number> {
+  const db = await getAdapter();
+  const rows = await db.run(
+    "SELECT COUNT(*) AS n FROM users WHERE role = ?",
+    ["admin"],
+    true
+  );
+  return Number(rows[0]?.n ?? rows[0]?.count ?? 0);
+}
+
+/* ─────────────── Sessions ─────────────── */
+
+export interface SessionRow {
+  id: string;
+  userId: string;
+  expiresAt: string;
+}
+
+export async function insertSession(
+  id: string,
+  userId: string,
+  expiresAt: string
+): Promise<void> {
+  const db = await getAdapter();
+  await db.run(
+    "INSERT INTO sessions (id, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)",
+    [id, userId, new Date().toISOString(), expiresAt],
+    false
+  );
+}
+
+export async function findSession(id: string): Promise<SessionRow | null> {
+  const db = await getAdapter();
+  const rows = await db.run("SELECT * FROM sessions WHERE id = ?", [id], true);
+  if (!rows[0]) return null;
+  return {
+    id: rows[0].id,
+    userId: rows[0].user_id,
+    expiresAt: rows[0].expires_at,
+  };
+}
+
+export async function deleteSession(id: string): Promise<void> {
+  const db = await getAdapter();
+  await db.run("DELETE FROM sessions WHERE id = ?", [id], false);
+}
+
+export async function deleteSessionsForUser(userId: string): Promise<void> {
+  const db = await getAdapter();
+  await db.run("DELETE FROM sessions WHERE user_id = ?", [userId], false);
+}
+
+export async function purgeExpiredSessions(): Promise<void> {
+  const db = await getAdapter();
+  await db.run(
+    "DELETE FROM sessions WHERE expires_at < ?",
+    [new Date().toISOString()],
+    false
+  );
 }
 
 /* ─────────────── Connection test ─────────────── */
