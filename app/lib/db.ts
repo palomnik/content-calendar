@@ -2,8 +2,14 @@
 //
 // Supports the built-in SQLite database (default) as well as external
 // MySQL, MariaDB, and PostgreSQL databases. The active provider and its
-// connection settings are persisted to data/db-config.json and can be
-// changed at runtime from the configuration screen (/settings).
+// connection settings come from one of two places:
+//
+//   1. Environment variables (DATABASE_URL, or discrete DB_* vars). These win
+//      when present and make the configuration read-only — required on hosts
+//      with a read-only filesystem, such as Vercel, where nothing can be
+//      persisted to disk between requests.
+//   2. data/db-config.json, written at runtime from /settings. Used on hosts
+//      with a real writable disk (Coolify, Railway, Render, local dev).
 //
 // All table columns are snake_case and identical across every provider so
 // the same INSERT/UPDATE/SELECT statements work everywhere. Statements are
@@ -15,12 +21,22 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 
 export type Provider = "sqlite" | "mysql" | "mariadb" | "postgres";
 
+// How to treat TLS on the connection. Mirrors libpq's sslmode semantics, which
+// is what every managed provider documents:
+//   disable — plain TCP. Only sane for localhost.
+//   require — encrypt, but do not verify the server certificate.
+//   verify  — encrypt and verify the certificate against the trust store.
+// Managed providers (Neon, Supabase, RDS) reject unencrypted connections, so
+// anything not on localhost needs at least "require".
+export type SslMode = "disable" | "require" | "verify";
+
 export interface DbConnection {
   host: string;
   port: number;
   user: string;
   password: string;
   database: string;
+  ssl?: SslMode;
 }
 
 export interface DbConfig {
@@ -34,9 +50,161 @@ const SQLITE_PATH = join(process.cwd(), "content_calendar.db");
 
 const DEFAULT_CONFIG: DbConfig = { provider: "sqlite" };
 
+const DEFAULT_PORT: Record<Provider, number> = {
+  sqlite: 0,
+  mysql: 3306,
+  mariadb: 3306,
+  postgres: 5432,
+};
+
+// URL scheme → provider. Both Postgres spellings are in the wild; providers
+// hand out `postgres://` and `postgresql://` interchangeably.
+const PROVIDER_BY_SCHEME: Record<string, Provider> = {
+  "postgres:": "postgres",
+  "postgresql:": "postgres",
+  "mysql:": "mysql",
+  "mariadb:": "mariadb",
+};
+
+/* ─────────────── Environment configuration ─────────────── */
+
+// Connection URLs we recognise, in precedence order. DATABASE_URL is the
+// convention; POSTGRES_URL is what Vercel's Neon/Postgres integration injects.
+const URL_VARS = ["DATABASE_URL", "POSTGRES_URL"];
+
+function isLocalHost(host: string): boolean {
+  return host === "localhost" || host === "127.0.0.1" || host === "::1";
+}
+
+function parseSslMode(raw: string | null | undefined, host: string): SslMode {
+  if (raw) {
+    const v = raw.trim().toLowerCase();
+    if (v === "disable" || v === "false" || v === "off" || v === "0") {
+      return "disable";
+    }
+    // libpq's verify-ca/verify-full both mean "check the certificate".
+    if (v === "verify" || v === "verify-ca" || v === "verify-full") {
+      return "verify";
+    }
+    if (v === "require" || v === "true" || v === "on" || v === "1" ||
+        v === "prefer" || v === "allow" || v === "no-verify") {
+      return "require";
+    }
+    throw new Error(`Unrecognised SSL mode: ${raw}`);
+  }
+  // No explicit mode: managed databases are remote and always want TLS, but
+  // a local Postgres in Docker generally has none configured.
+  return isLocalHost(host) ? "disable" : "require";
+}
+
+// Parse a connection URL such as
+//   postgresql://user:pass@host:5432/dbname?sslmode=require
+function parseDbUrl(raw: string, source: string): DbConfig {
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw new Error(`${source} is not a valid connection URL.`);
+  }
+
+  const provider = PROVIDER_BY_SCHEME[url.protocol];
+  if (!provider) {
+    throw new Error(
+      `${source} has unsupported scheme "${url.protocol.replace(":", "")}". ` +
+        `Expected one of: postgres, postgresql, mysql, mariadb.`
+    );
+  }
+
+  const database = url.pathname.replace(/^\//, "");
+  if (!database) throw new Error(`${source} is missing a database name.`);
+  if (!url.hostname) throw new Error(`${source} is missing a host.`);
+
+  // URL-encoded credentials are common — passwords routinely contain @ and /.
+  const user = decodeURIComponent(url.username);
+  const password = decodeURIComponent(url.password);
+  if (!user) throw new Error(`${source} is missing a username.`);
+
+  return {
+    provider,
+    connection: {
+      host: url.hostname,
+      port: Number(url.port) || DEFAULT_PORT[provider],
+      user,
+      password,
+      database: decodeURIComponent(database),
+      ssl: parseSslMode(url.searchParams.get("sslmode"), url.hostname),
+    },
+  };
+}
+
+// Build a config from discrete DB_* variables, for hosts where a single URL is
+// awkward. Returns null when DB_PROVIDER is absent.
+function parseDiscreteEnv(): DbConfig | null {
+  const provider = process.env.DB_PROVIDER?.trim().toLowerCase();
+  if (!provider) return null;
+
+  if (provider === "sqlite") return { provider: "sqlite" };
+  if (provider !== "mysql" && provider !== "mariadb" && provider !== "postgres") {
+    throw new Error(
+      `DB_PROVIDER is "${provider}". Expected sqlite, mysql, mariadb, or postgres.`
+    );
+  }
+
+  const host = process.env.DB_HOST?.trim();
+  const database = process.env.DB_NAME?.trim();
+  const user = process.env.DB_USER?.trim();
+  const missing = [
+    !host && "DB_HOST",
+    !database && "DB_NAME",
+    !user && "DB_USER",
+  ].filter(Boolean);
+  if (missing.length) {
+    throw new Error(
+      `DB_PROVIDER=${provider} requires ${missing.join(", ")} to also be set.`
+    );
+  }
+
+  return {
+    provider,
+    connection: {
+      host: host!,
+      port: Number(process.env.DB_PORT) || DEFAULT_PORT[provider],
+      user: user!,
+      password: process.env.DB_PASSWORD ?? "",
+      database: database!,
+      ssl: parseSslMode(process.env.DB_SSL, host!),
+    },
+  };
+}
+
+/**
+ * Configuration supplied by the environment, or null if none is set.
+ *
+ * Deliberately throws on a malformed value rather than falling back to SQLite.
+ * A silent fallback is how a misconfigured deployment ends up quietly writing
+ * to a throwaway file instead of the database you meant to use.
+ */
+export function envConfig(): DbConfig | null {
+  for (const name of URL_VARS) {
+    const raw = process.env[name]?.trim();
+    if (raw) return parseDbUrl(raw, name);
+  }
+  return parseDiscreteEnv();
+}
+
+/** True when the environment pins the configuration, making /settings read-only. */
+export function isEnvConfigured(): boolean {
+  return envConfig() !== null;
+}
+
 /* ─────────────── Config persistence ─────────────── */
 
 export function readConfig(): DbConfig {
+  // The environment wins: on a read-only host it is the only thing that can
+  // carry a configuration into the running process.
+  const fromEnv = envConfig();
+  if (fromEnv) return fromEnv;
+
   try {
     if (existsSync(CONFIG_PATH)) {
       const parsed = JSON.parse(readFileSync(CONFIG_PATH, "utf8"));
@@ -49,6 +217,13 @@ export function readConfig(): DbConfig {
 }
 
 export function writeConfig(config: DbConfig): void {
+  if (isEnvConfigured()) {
+    throw new Error(
+      "The database is configured by environment variables, which take " +
+        "precedence and cannot be overwritten from here. Change DATABASE_URL " +
+        "(or the DB_* variables) in your hosting provider instead."
+    );
+  }
   if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
   writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2), "utf8");
   // Invalidate any cached adapter so the next request reconnects.
@@ -58,11 +233,13 @@ export function writeConfig(config: DbConfig): void {
 
 /** Config safe to send to the browser (password redacted). */
 export function publicConfig(config: DbConfig = readConfig()) {
-  if (!config.connection) return { provider: config.provider };
+  const envLocked = isEnvConfigured();
+  if (!config.connection) return { provider: config.provider, envLocked };
   const { password, ...rest } = config.connection;
   return {
     provider: config.provider,
     connection: { ...rest, hasPassword: Boolean(password) },
+    envLocked,
   };
 }
 
@@ -184,6 +361,33 @@ function ddlStatements(provider: Provider): string[] {
   ];
 }
 
+/* ---- Shared connection helpers ---- */
+
+// Translate our SslMode into the `ssl` option both drivers accept.
+// `undefined` means "no TLS" to pg and mysql2 alike.
+function sslOption(mode: SslMode | undefined) {
+  switch (mode) {
+    case "verify":
+      return { rejectUnauthorized: true };
+    case "require":
+      // Encrypt without validating the chain. This is what libpq's
+      // sslmode=require means, and it is what lets self-signed certificates on
+      // self-hosted databases work.
+      return { rejectUnauthorized: false };
+    default:
+      return undefined;
+  }
+}
+
+// Pool size per process. Serverless multiplies processes, so the effective
+// connection count is this times the number of warm instances — keep it small
+// and point at the provider's pooled connection string.
+function poolMax(): number {
+  const raw = Number(process.env.DB_POOL_MAX);
+  if (Number.isFinite(raw) && raw > 0) return Math.floor(raw);
+  return process.env.VERCEL ? 2 : 5;
+}
+
 /* ---- SQLite (better-sqlite3, synchronous) ---- */
 
 class SqliteAdapter implements Adapter {
@@ -191,6 +395,15 @@ class SqliteAdapter implements Adapter {
 
   async init() {
     if (this.db) return;
+    // SQLite needs a writable, persistent disk. Serverless hosts have neither,
+    // so fail with an explanation rather than an opaque SQLITE_CANTOPEN.
+    if (process.env.VERCEL) {
+      throw new Error(
+        "SQLite cannot be used on Vercel: the filesystem is read-only and " +
+          "nothing written by one request survives into the next. Set " +
+          "DATABASE_URL to a Postgres/MySQL connection string instead."
+      );
+    }
     const Database = require("better-sqlite3");
     this.db = new Database(SQLITE_PATH);
     this.db.pragma("journal_mode = WAL");
@@ -221,8 +434,9 @@ class MysqlAdapter implements Adapter {
       user: this.conn.user,
       password: this.conn.password,
       database: this.conn.database,
+      ssl: sslOption(this.conn.ssl),
       waitForConnections: true,
-      connectionLimit: 5,
+      connectionLimit: poolMax(),
     });
     for (const stmt of ddlStatements("mysql")) await this.pool.query(stmt);
   }
@@ -249,7 +463,8 @@ class PostgresAdapter implements Adapter {
       user: this.conn.user,
       password: this.conn.password,
       database: this.conn.database,
-      max: 5,
+      ssl: sslOption(this.conn.ssl),
+      max: poolMax(),
     });
     for (const stmt of ddlStatements("postgres")) await this.pool.query(stmt);
   }

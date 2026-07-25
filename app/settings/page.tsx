@@ -451,6 +451,10 @@ function DatabaseSection() {
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState<"save" | "test" | null>(null);
   const [message, setMessage] = useState<Message>(null);
+  // Set when the server reads its configuration from environment variables.
+  // Nothing here can be saved in that case — on hosts with a read-only
+  // filesystem (Vercel) the environment is the only way to configure the app.
+  const [envLocked, setEnvLocked] = useState(false);
 
   useEffect(() => {
     fetch("/api/config")
@@ -458,6 +462,7 @@ function DatabaseSection() {
       .then((cfg) => {
         if (cfg.error) throw new Error(cfg.error);
         setProvider(cfg.provider || "sqlite");
+        setEnvLocked(Boolean(cfg.envLocked));
         if (cfg.connection) {
           setConn({
             host: cfg.connection.host || "",
@@ -527,10 +532,22 @@ function DatabaseSection() {
         <div className="skeleton h-40 w-full rounded-xl" />
       ) : (
         <div className="space-y-6">
-          <div className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800 dark:border-amber-800 dark:bg-[#2e2618] dark:text-amber-200">
-            User accounts live in the active database. Switching providers switches the account
-            store too — the new database will prompt for administrator setup if it has no users.
-          </div>
+          {envLocked ? (
+            <div className="rounded-lg border border-[var(--border)] bg-[var(--surface)] px-4 py-3 text-sm text-[var(--muted)]">
+              <span className="font-semibold text-[var(--foreground)]">
+                Managed by environment variables.
+              </span>{" "}
+              This deployment reads its database settings from <code>DATABASE_URL</code> (or the{" "}
+              <code>DB_*</code> variables), which take precedence over anything saved here. The
+              settings below are read-only. To change them, update the variables in your hosting
+              provider and redeploy.
+            </div>
+          ) : (
+            <div className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800 dark:border-amber-800 dark:bg-[#2e2618] dark:text-amber-200">
+              User accounts live in the active database. Switching providers switches the account
+              store too — the new database will prompt for administrator setup if it has no users.
+            </div>
+          )}
 
           {/* Provider selector */}
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
@@ -538,11 +555,12 @@ function DatabaseSection() {
               <button
                 key={p.value}
                 type="button"
+                disabled={envLocked}
                 onClick={() => setProvider(p.value)}
-                className={`rounded-xl border p-4 text-left transition ${
+                className={`rounded-xl border p-4 text-left transition disabled:cursor-not-allowed disabled:opacity-60 ${
                   provider === p.value
                     ? "border-[var(--accent)] ring-1 ring-[var(--accent)]"
-                    : "border-[var(--border)] hover:bg-[var(--surface)]"
+                    : "border-[var(--border)] enabled:hover:bg-[var(--surface)]"
                 }`}
               >
                 <div className="flex items-center justify-between">
@@ -562,6 +580,7 @@ function DatabaseSection() {
                   <label className={labelClass}>Host</label>
                   <input
                     className={inputClass}
+                    disabled={envLocked}
                     placeholder="db.example.com"
                     value={conn.host}
                     onChange={(e) => setConn((c) => ({ ...c, host: e.target.value }))}
@@ -571,6 +590,7 @@ function DatabaseSection() {
                   <label className={labelClass}>Port</label>
                   <input
                     className={inputClass}
+                    disabled={envLocked}
                     placeholder={defaultPort}
                     value={conn.port}
                     onChange={(e) => setConn((c) => ({ ...c, port: e.target.value }))}
@@ -581,7 +601,8 @@ function DatabaseSection() {
                 <label className={labelClass}>Database</label>
                 <input
                   className={inputClass}
-                  placeholder="content_calendar"
+                  disabled={envLocked}
+                    placeholder="content_calendar"
                   value={conn.database}
                   onChange={(e) => setConn((c) => ({ ...c, database: e.target.value }))}
                 />
@@ -591,6 +612,7 @@ function DatabaseSection() {
                   <label className={labelClass}>User</label>
                   <input
                     className={inputClass}
+                    disabled={envLocked}
                     placeholder="app_user"
                     value={conn.user}
                     onChange={(e) => setConn((c) => ({ ...c, user: e.target.value }))}
@@ -601,6 +623,7 @@ function DatabaseSection() {
                   <input
                     type="password"
                     className={inputClass}
+                    disabled={envLocked}
                     placeholder={hasStoredPassword ? "•••••••• (unchanged)" : "password"}
                     value={conn.password}
                     onChange={(e) => setConn((c) => ({ ...c, password: e.target.value }))}
@@ -616,15 +639,23 @@ function DatabaseSection() {
 
           <Notice message={message} />
 
+          {/* Saving is impossible while the environment supplies the config, but
+              testing the live connection is still useful for diagnosis. */}
           <div className="flex items-center gap-3">
-            <button onClick={() => submit(false)} disabled={busy !== null} className={primaryButton}>
-              {busy === "save" ? "Saving…" : "Save"}
-            </button>
+            {!envLocked && (
+              <button
+                onClick={() => submit(false)}
+                disabled={busy !== null}
+                className={primaryButton}
+              >
+                {busy === "save" ? "Saving…" : "Save"}
+              </button>
+            )}
             {isExternal && (
               <button
                 onClick={() => submit(true)}
                 disabled={busy !== null}
-                className={secondaryButton}
+                className={envLocked ? primaryButton : secondaryButton}
               >
                 {busy === "test" ? "Testing…" : "Test connection"}
               </button>

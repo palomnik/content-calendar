@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import {
   DbConfig,
   Provider,
+  SslMode,
   publicConfig,
   readConfig,
   testConfig,
@@ -10,9 +11,12 @@ import {
 import { requireAdmin } from "../../lib/auth";
 
 const PROVIDERS: Provider[] = ["sqlite", "mysql", "mariadb", "postgres"];
+const SSL_MODES: SslMode[] = ["disable", "require", "verify"];
 
-// Build a full DbConfig from a request body, carrying forward the stored
-// password when the client sends a blank one (it never receives the real one).
+// Build a full DbConfig from a request body. The browser never receives the
+// password or the SSL mode, so when it sends neither we carry the stored values
+// forward — otherwise a "Test connection" on a pre-filled form would try a
+// blank password, or guess the wrong TLS mode, and fail misleadingly.
 function normalize(body: any): DbConfig {
   const provider = body?.provider as Provider;
   if (!PROVIDERS.includes(provider)) {
@@ -25,18 +29,36 @@ function normalize(body: any): DbConfig {
     throw new Error("Host, database, and user are required.");
   }
 
-  let password = typeof c.password === "string" ? c.password : "";
-  // Blank password + existing config for the same target → reuse stored one.
-  if (!password) {
-    const current = readConfig();
-    if (
-      current.connection &&
-      current.connection.host === c.host &&
-      current.connection.database === c.database &&
-      current.connection.user === c.user
-    ) {
-      password = current.connection.password;
+  // The stored config, but only when it describes the same target — otherwise
+  // we would leak one database's password into a connection to another.
+  const current = readConfig();
+  const sameTarget =
+    current.connection &&
+    current.connection.host === c.host &&
+    current.connection.database === c.database &&
+    current.connection.user === c.user
+      ? current.connection
+      : null;
+
+  const password =
+    (typeof c.password === "string" && c.password) || sameTarget?.password || "";
+
+  let ssl: SslMode;
+  if (c.ssl !== undefined && c.ssl !== null && c.ssl !== "") {
+    if (!SSL_MODES.includes(c.ssl)) {
+      throw new Error(
+        `Unknown SSL mode: ${c.ssl}. Expected ${SSL_MODES.join(", ")}.`
+      );
     }
+    ssl = c.ssl;
+  } else if (sameTarget?.ssl) {
+    ssl = sameTarget.ssl;
+  } else {
+    // Nothing to go on: remote databases require TLS, a local one has none.
+    const host = String(c.host);
+    const local =
+      host === "localhost" || host === "127.0.0.1" || host === "::1";
+    ssl = local ? "disable" : "require";
   }
 
   return {
@@ -47,6 +69,7 @@ function normalize(body: any): DbConfig {
       user: String(c.user),
       password,
       database: String(c.database),
+      ssl,
     },
   };
 }

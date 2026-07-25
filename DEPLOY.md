@@ -53,26 +53,44 @@ Build should complete successfully with 2 API routes (`/api/items`, `/api/items/
 
 ---
 
-## Option A: Vercel (Recommended — easiest)
+## Choosing a host
 
-### One-time setup
+The app stores everything — content, users, sessions — in one database. Which
+host suits you depends entirely on whether that database can be a local file.
 
-1. Go to https://vercel.com/new and import `palomnik/content-calendar`
-2. Vercel auto-detects Next.js — keep defaults
-3. Add environment variable if needed: `NODE_OPTIONS="--no-warnings"`
-4. Deploy
+| Host | Filesystem | Database |
+|---|---|---|
+| Coolify, Railway, Render | Persistent container disk | Built-in SQLite, no setup |
+| Vercel | Read-only, ephemeral | **Requires** external Postgres/MySQL |
 
-### Auto-deploy from pushes
+SQLite needs a writable file that survives between requests. Vercel's
+serverless functions provide neither, so a deployment there must be pointed at
+a network database via `DATABASE_URL`. This is not a settings problem — Vercel
+has no persistent disk to offer.
 
-Once connected, every push to `main` auto-deploys.
+---
+
+## Option A: Vercel (requires an external database)
+
+Vercel needs a Postgres database and one environment variable. The full
+walkthrough — creating the database, connecting it, first-run setup, and
+troubleshooting — is in **[VERCEL.md](./VERCEL.md)**.
+
+The short version:
+
+1. Create a Postgres database (Neon's free tier, via Vercel's Storage tab).
+2. Import the GitHub repo at https://vercel.com/new — keep all build defaults.
+3. Set `DATABASE_URL` to the **pooled** connection string, and `SETUP_TOKEN`
+   to `openssl rand -hex 24`.
+4. Deploy, then open the URL and create the admin account.
+
+Environment variables are applied at deploy time, so **redeploy after changing
+them**. Once connected, every push to `main` auto-deploys.
 
 ### Using CLI (headless)
 
-If you prefer CLI deployment:
-
 ```bash
 vercel login
-# Then:
 vercel --prod
 ```
 
@@ -85,7 +103,11 @@ vercel --prod
 3. Railway auto-detects Node.js — keep defaults
 4. Deploy
 
-The SQLite DB will persist on Railway's ephemeral filesystem. For production durability, add a Railway Volume mounted at `/app/content_calendar.db`.
+Railway's container filesystem is **wiped on every redeploy**. SQLite works
+between deploys but the data does not survive one, so add a Railway Volume
+mounted at `/app/content_calendar.db` before putting anything real in it.
+Alternatively set `DATABASE_URL` to a Railway Postgres instance and skip
+volumes entirely.
 
 ---
 
@@ -102,7 +124,10 @@ The SQLite DB will persist on Railway's ephemeral filesystem. For production dur
 ## Architecture notes
 
 - **Runtime**: Node.js (required for API routes + better-sqlite3)
-- **Database**: SQLite file (`content_calendar.db`) — persists in working directory
+- **Database**: SQLite file (`content_calendar.db`) in the working directory by
+  default; Postgres/MySQL/MariaDB when `DATABASE_URL` or the `DB_*` variables
+  are set. Environment configuration wins over `data/db-config.json` and makes
+  `/settings` read-only — see [VERCEL.md](./VERCEL.md) for the full reference.
 - **Not suitable for**: Static export (`output: "export"`) — API routes need a server
 - **Tailwind**: v4 with CSS-first config (`@import "tailwindcss"`)
 

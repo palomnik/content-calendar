@@ -15,6 +15,13 @@ tsconfig.tsbuildinfo
 # Runtime DB configuration (may contain external DB credentials)
 data/db-config.json
 
+# Local environment files — these hold DATABASE_URL, which contains the
+# database password in plain text. Never commit them.
+.env
+.env.*
+!.env.example
+.vercel/
+
 # OS / editor
 .DS_Store
 *.swp
