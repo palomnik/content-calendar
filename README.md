@@ -1,3 +1,16 @@
+# Content Calendar Planning App
+
+This is an app for use by in-house marketing teams who do their own content planning and publishing. Many in-house teams struggle to implement a consistent system of regular content, coordinated by campaign and a coherent system.
+
+This app was developed by [John Simmons HyperText](https://johnsimmonshypertext.com) as part of a [Content Calendar Plan Course](https://johnsimmonshypertext.com/content/content-calendar-plan/). Taking this course is the best introduction to the system for using this app, and getting input from all stakeholders for a unified system with everyone on the same page. Prior to that course, Customers often did the [Digital Roadmap Workshop](https://johnsimmonshypertext.com/content/digital-roadmap-planning/) to identify the marketing content and activities with the highest ROI.
+
+It is advisable to do the workshop and course to get most use out of the app, but it is not essential, and some teams can benefit by using the app right away.
+
+Use or install the app in one of 3 ways.
+1. Just use the test mode as needed without saving data, except as a CSV export. [Access the test mode here](https://cc.app.jshypertext.com).
+2. Install your own instance on your server from this repository – it’s open source! 
+3. Get it installed in your own app server, which I can build for you. [Learn more here](https://johnsimmonshypertext.com/hosting-and-help/concierge-app-development-hosting/).
+
 This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
 
 ## Getting Started
