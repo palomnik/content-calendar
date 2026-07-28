@@ -667,6 +667,612 @@ function DatabaseSection() {
   );
 }
 
+/* ─────────────── AI assistant ─────────────── */
+
+// Mirrors LlmProviderDescriptor in app/lib/llm.ts. Declared locally because
+// that module reaches the filesystem and cannot be imported into a client
+// component; the catalogue itself arrives from GET /api/llm/connection.
+type LlmProvider = {
+  id: string;
+  label: string;
+  blurb: string;
+  apiKey: "required" | "optional" | "none";
+  baseUrl: "fixed" | "required" | "optional";
+  defaultBaseUrl: string;
+  defaultModel: string;
+  docsHint: string;
+};
+
+type StoredConnection = {
+  provider: string;
+  baseUrl: string | null;
+  model: string | null;
+  hasApiKey: boolean;
+  apiKeyBroken: boolean;
+} | null;
+
+/**
+ * The provider form, used for both a personal connection and the team default.
+ * `endpoint` decides which one is being edited.
+ */
+function LlmConnectionForm({
+  endpoint,
+  providers,
+  initial,
+  onSaved,
+  onCleared,
+  clearLabel,
+}: {
+  endpoint: string;
+  providers: LlmProvider[];
+  initial: StoredConnection;
+  onSaved: (c: StoredConnection) => void;
+  onCleared: () => void;
+  clearLabel: string;
+}) {
+  const first = providers[0]?.id ?? "anthropic";
+  const [providerId, setProviderId] = useState(initial?.provider ?? first);
+  const [baseUrl, setBaseUrl] = useState(initial?.baseUrl ?? "");
+  const [model, setModel] = useState(initial?.model ?? "");
+  const [apiKey, setApiKey] = useState("");
+  const [hasStoredKey, setHasStoredKey] = useState(Boolean(initial?.hasApiKey));
+  const [keyBroken, setKeyBroken] = useState(Boolean(initial?.apiKeyBroken));
+  const [busy, setBusy] = useState<"save" | "test" | "clear" | null>(null);
+  const [message, setMessage] = useState<Message>(null);
+
+  const descriptor =
+    providers.find((p) => p.id === providerId) ?? providers[0] ?? null;
+
+  const pickProvider = (next: LlmProvider) => {
+    setProviderId(next.id);
+    setMessage(null);
+    // Offer the provider's defaults rather than carrying the previous
+    // provider's model or URL across, which would never be valid.
+    setModel(next.id === initial?.provider ? initial?.model ?? next.defaultModel : next.defaultModel);
+    setBaseUrl(
+      next.baseUrl === "fixed"
+        ? ""
+        : next.id === initial?.provider
+          ? initial?.baseUrl ?? next.defaultBaseUrl
+          : next.defaultBaseUrl
+    );
+  };
+
+  const submit = async (test: boolean) => {
+    setBusy(test ? "test" : "save");
+    setMessage(null);
+    try {
+      const data = await postJson(endpoint, {
+        provider: providerId,
+        baseUrl: baseUrl.trim() || undefined,
+        model: model.trim() || undefined,
+        apiKey,
+        test,
+      });
+      if (test) {
+        setMessage({
+          type: "success",
+          text: data.note ?? `Connected. Using ${data.model}.`,
+        });
+      } else {
+        setMessage({ type: "success", text: data.note ?? "Saved." });
+        setApiKey("");
+        setHasStoredKey(Boolean(data.connection?.hasApiKey));
+        setKeyBroken(false);
+        onSaved(data.connection ?? null);
+      }
+    } catch (e: any) {
+      setMessage({ type: "error", text: e.message });
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const clear = async () => {
+    if (!window.confirm(clearLabel)) return;
+    setBusy("clear");
+    setMessage(null);
+    try {
+      await postJson(endpoint, {}, "DELETE");
+      setApiKey("");
+      setHasStoredKey(false);
+      setKeyBroken(false);
+      onCleared();
+    } catch (e: any) {
+      setMessage({ type: "error", text: e.message });
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  if (!descriptor) return null;
+
+  return (
+    <div className="space-y-6">
+      {keyBroken && (
+        <div className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800 dark:border-amber-800 dark:bg-[#2e2618] dark:text-amber-200">
+          The saved API key can no longer be read — the server&apos;s encryption key
+          changed. Enter the key again to restore access.
+        </div>
+      )}
+
+      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+        {providers.map((p) => (
+          <button
+            key={p.id}
+            type="button"
+            onClick={() => pickProvider(p)}
+            className={`rounded-xl border p-4 text-left transition ${
+              providerId === p.id
+                ? "border-[var(--accent)] ring-1 ring-[var(--accent)]"
+                : "border-[var(--border)] hover:bg-[var(--surface)]"
+            }`}
+          >
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-sm font-semibold text-[var(--foreground)]">
+                {p.label}
+              </span>
+              {providerId === p.id && <span className="text-[var(--accent)]">✓</span>}
+            </div>
+            <p className="mt-1 text-xs text-[var(--muted)]">{p.blurb}</p>
+          </button>
+        ))}
+      </div>
+
+      <div className="space-y-4">
+        {descriptor.baseUrl !== "fixed" && (
+          <div>
+            <label className={labelClass}>
+              Base URL{descriptor.baseUrl === "optional" ? " (optional)" : ""}
+            </label>
+            <input
+              className={inputClass}
+              placeholder={descriptor.defaultBaseUrl || "https://…"}
+              value={baseUrl}
+              onChange={(e) => setBaseUrl(e.target.value)}
+            />
+          </div>
+        )}
+
+        <div>
+          <label className={labelClass}>Model</label>
+          <input
+            className={inputClass}
+            placeholder={descriptor.defaultModel || "model name"}
+            value={model}
+            onChange={(e) => setModel(e.target.value)}
+          />
+        </div>
+
+        {descriptor.apiKey !== "none" && (
+          <div>
+            <label className={labelClass}>
+              API key{descriptor.apiKey === "optional" ? " (optional)" : ""}
+            </label>
+            <input
+              type="password"
+              autoComplete="off"
+              className={inputClass}
+              placeholder={
+                hasStoredKey && !keyBroken ? "•••••••• (unchanged)" : "Paste your key"
+              }
+              value={apiKey}
+              onChange={(e) => setApiKey(e.target.value)}
+            />
+          </div>
+        )}
+
+        <p className="text-xs text-[var(--muted)]">{descriptor.docsHint}</p>
+      </div>
+
+      <Notice message={message} />
+
+      <div className="flex flex-wrap items-center gap-3">
+        <button
+          onClick={() => submit(false)}
+          disabled={busy !== null}
+          className={primaryButton}
+        >
+          {busy === "save" ? "Saving…" : "Save"}
+        </button>
+        <button
+          onClick={() => submit(true)}
+          disabled={busy !== null}
+          className={secondaryButton}
+        >
+          {busy === "test" ? "Testing…" : "Test connection"}
+        </button>
+        {initial && (
+          <button
+            onClick={clear}
+            disabled={busy !== null}
+            className="rounded-lg border border-[var(--danger)] px-4 py-2 text-sm font-medium text-[var(--danger)] transition hover:bg-[var(--danger-hover)] hover:text-white disabled:opacity-50"
+          >
+            {busy === "clear" ? "Removing…" : "Remove"}
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function AiSection({ user }: { user: SessionUser }) {
+  const [loading, setLoading] = useState(true);
+  const [providers, setProviders] = useState<LlmProvider[]>([]);
+  const [own, setOwn] = useState<StoredConnection>(null);
+  const [org, setOrg] = useState<StoredConnection>(null);
+  const [encryption, setEncryption] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  // A user inheriting the team default only sees the form once they ask to
+  // override it, so the common case stays a single line of text.
+  const [overriding, setOverriding] = useState(false);
+
+  const fetchConnections = useCallback(
+    () =>
+      fetch("/api/llm/connection")
+        .then((r) => r.json())
+        .then((data) => {
+          if (data.error) throw new Error(data.error);
+          setProviders(data.providers ?? []);
+          setOwn(data.connection ?? null);
+          setOrg(data.orgConnection ?? null);
+          setEncryption(data.encryptionProblem ?? null);
+          setLoadError(null);
+        })
+        .catch((e) => setLoadError(e.message || "Failed to load AI settings."))
+        .finally(() => setLoading(false)),
+    []
+  );
+
+  useEffect(() => {
+    void fetchConnections();
+  }, [fetchConnections]);
+
+  /** Re-read from the server after a change that can shift what is inherited. */
+  const reload = useCallback(() => {
+    setLoading(true);
+    void fetchConnections();
+  }, [fetchConnections]);
+
+  const providerLabel = (id?: string) =>
+    providers.find((p) => p.id === id)?.label ?? id ?? "";
+
+  const inheriting = !own && org;
+  const showForm = Boolean(own) || overriding || !org;
+
+  return (
+    <>
+      <Section
+        title="AI assistant"
+        description="Connect a model provider to generate outlines, drafts, and campaign ideas. Your key is encrypted before it is stored and is never shown again."
+      >
+        {loading ? (
+          <div className="skeleton h-40 w-full rounded-xl" />
+        ) : loadError ? (
+          <Notice message={{ type: "error", text: loadError }} />
+        ) : (
+          <div className="space-y-6">
+            {encryption && (
+              <div className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800 dark:border-amber-800 dark:bg-[#2e2618] dark:text-amber-200">
+                {encryption}
+              </div>
+            )}
+
+            {inheriting && (
+              <div className="rounded-lg border border-[var(--border)] bg-[var(--surface)] px-4 py-3 text-sm text-[var(--muted)]">
+                <span className="font-semibold text-[var(--foreground)]">
+                  Using the team default
+                </span>{" "}
+                ({providerLabel(org!.provider)}
+                {org!.model ? ` · ${org!.model}` : ""}). Set your own connection to
+                use a different provider or bill usage to your own account.
+                {!overriding && (
+                  <button
+                    onClick={() => setOverriding(true)}
+                    className="mt-3 block rounded-lg border border-[var(--border)] bg-[var(--background)] px-3 py-1.5 text-sm font-medium text-[var(--foreground)] transition hover:bg-[var(--surface-hover)]"
+                  >
+                    Use my own key instead
+                  </button>
+                )}
+              </div>
+            )}
+
+            {showForm && (
+              <LlmConnectionForm
+                endpoint="/api/llm/connection"
+                providers={providers}
+                initial={own}
+                onSaved={(c) => {
+                  setOwn(c);
+                  setOverriding(false);
+                }}
+                onCleared={() => {
+                  setOwn(null);
+                  setOverriding(false);
+                  reload();
+                }}
+                clearLabel="Remove your saved AI connection? You will fall back to the team default if one exists."
+              />
+            )}
+          </div>
+        )}
+      </Section>
+
+      {user.role === "admin" && !loading && !loadError && (
+        <Section
+          title="Team AI default"
+          description="An optional shared connection. Users who have not set up their own AI connection generate with this one, and its usage is billed to this key."
+        >
+          <LlmConnectionForm
+            endpoint="/api/llm/org-connection"
+            providers={providers}
+            initial={org}
+            onSaved={(c) => setOrg(c)}
+            onCleared={() => {
+              setOrg(null);
+              reload();
+            }}
+            clearLabel="Remove the team default? Users without their own connection will lose AI access until they add one."
+          />
+        </Section>
+      )}
+    </>
+  );
+}
+
+/* ─────────────── Backup ─────────────── */
+
+function BackupSection() {
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState<Message>(null);
+
+  const download = async () => {
+    setBusy(true);
+    setMessage(null);
+    try {
+      const res = await fetch("/api/backup");
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.error || `${res.status} ${res.statusText}`);
+      }
+
+      const text = await res.text();
+      // The route reports a mid-stream failure in the file rather than in the
+      // status code, which has already been sent by then.
+      if (text.includes("-- BACKUP FAILED PART WAY THROUGH:")) {
+        const reason = text.split("-- BACKUP FAILED PART WAY THROUGH:")[1].split("\n")[0];
+        throw new Error(`The backup did not finish:${reason}`);
+      }
+
+      const name =
+        /filename="([^"]+)"/.exec(res.headers.get("Content-Disposition") ?? "")?.[1] ??
+        `content_calendar_backup_${new Date().toISOString().slice(0, 10)}.sql`;
+
+      const blob = new Blob([text], { type: "application/sql" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = name;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+
+      const rows = (text.match(/^INSERT INTO /gm) ?? []).length;
+      const size = text.length < 1_048_576
+        ? `${Math.max(1, Math.round(text.length / 1024))} KB`
+        : `${(text.length / 1_048_576).toFixed(1)} MB`;
+      setMessage({
+        type: "success",
+        text: `Downloaded ${name} — ${rows.toLocaleString()} row${rows === 1 ? "" : "s"}, ${size}.`,
+      });
+    } catch (e: any) {
+      setMessage({ type: "error", text: e.message });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Section
+      title="Backup"
+      description="Download the whole database as a SQL file — content items, accounts, and AI connections. Restore it with your database's own command-line tool."
+    >
+      <div className="space-y-6">
+        <div className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800 dark:border-amber-800 dark:bg-[#2e2618] dark:text-amber-200">
+          <span className="font-semibold">Keep this file private.</span> It contains
+          every account&apos;s password hash and each user&apos;s encrypted AI provider
+          key. Those keys can only be read again by a server using the same{" "}
+          <code>APP_ENCRYPTION_KEY</code>; restore onto a server without it and each
+          user must enter their key again.
+        </div>
+
+        <p className="text-sm text-[var(--muted)]">
+          Active sessions are not included — everyone signs in again after a restore.
+          The file is written to restore into an <strong>empty</strong> database; the
+          commands for each provider are in a comment at the top of the file.
+        </p>
+
+        <Notice message={message} />
+
+        <button onClick={download} disabled={busy} className={primaryButton}>
+          {busy ? "Preparing…" : "Download SQL backup"}
+        </button>
+      </div>
+    </Section>
+  );
+}
+
+/* ─────────────── Restore ─────────────── */
+
+type RestorePreview = {
+  fileName: string;
+  sql: string;
+  sourceProvider: string | null;
+  generatedAt: string | null;
+  targetProvider: string;
+  counts: Record<string, number>;
+  admins: number;
+  warnings: string[];
+};
+
+const TABLE_LABELS: Record<string, string> = {
+  content_items: "content items",
+  users: "accounts",
+  llm_connections: "AI connections",
+};
+
+function RestoreSection() {
+  const [preview, setPreview] = useState<RestorePreview | null>(null);
+  const [busy, setBusy] = useState<"inspect" | "restore" | null>(null);
+  const [message, setMessage] = useState<Message>(null);
+  const [done, setDone] = useState(false);
+
+  // Reading the file and asking the server what is in it changes nothing —
+  // it is the confirmation step that commits.
+  const pickFile = async () => {
+    setMessage(null);
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = ".sql,text/plain";
+    input.onchange = async () => {
+      const file = input.files?.[0];
+      if (!file) return;
+      setBusy("inspect");
+      try {
+        const sql = await file.text();
+        const data = await postJson("/api/restore", { sql, inspect: true });
+        setPreview({
+          fileName: file.name,
+          sql,
+          sourceProvider: data.sourceProvider ?? null,
+          generatedAt: data.generatedAt ?? null,
+          targetProvider: data.targetProvider,
+          counts: data.counts ?? {},
+          admins: data.admins ?? 0,
+          warnings: data.warnings ?? [],
+        });
+      } catch (e: any) {
+        setPreview(null);
+        setMessage({ type: "error", text: e.message });
+      } finally {
+        setBusy(null);
+      }
+    };
+    input.click();
+  };
+
+  const commit = async () => {
+    if (!preview) return;
+    const totals = Object.entries(preview.counts)
+      .map(([table, n]) => `${n} ${TABLE_LABELS[table] ?? table}`)
+      .join(", ");
+    if (
+      !window.confirm(
+        `This deletes EVERY content item, account, and AI connection in the ` +
+          `current database and replaces them with the contents of ` +
+          `${preview.fileName} (${totals}).\n\n` +
+          `You will be signed out, and you must sign in with an account from ` +
+          `the backup — not your current password unless it is the same account.\n\n` +
+          `This cannot be undone. Continue?`
+      )
+    ) {
+      return;
+    }
+
+    setBusy("restore");
+    setMessage(null);
+    try {
+      const data = await postJson("/api/restore", { sql: preview.sql });
+      const written = Object.entries(data.inserted ?? {})
+        .map(([table, n]) => `${n} ${TABLE_LABELS[table] ?? table}`)
+        .join(", ");
+      setDone(true);
+      setPreview(null);
+      setMessage({
+        type: "success",
+        text: `Restored ${written}. Everyone has been signed out — sign in again with an account from the backup.`,
+      });
+    } catch (e: any) {
+      setMessage({ type: "error", text: e.message });
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  return (
+    <Section
+      title="Restore"
+      description="Load a backup file back into the database. The file is checked and summarised before anything is changed."
+    >
+      <div className="space-y-6">
+        <div className="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700 dark:border-red-800 dark:bg-[#2e1a1a] dark:text-red-300">
+          <span className="font-semibold">Restoring replaces everything.</span> Every
+          content item, account, and AI connection in the current database is deleted
+          and rewritten from the file. Take a backup first if the current data still
+          matters. It all happens in one transaction, so a failure part way through
+          leaves the database untouched.
+        </div>
+
+        {preview && (
+          <div className="rounded-lg border border-[var(--border)] bg-[var(--surface)] px-4 py-3 text-sm">
+            <p className="mb-2 font-semibold text-[var(--foreground)]">
+              {preview.fileName}
+            </p>
+            <ul className="space-y-1 text-[var(--muted)]">
+              {Object.entries(preview.counts).map(([table, n]) => (
+                <li key={table}>
+                  {n.toLocaleString()} {TABLE_LABELS[table] ?? table}
+                  {table === "users" && preview.admins > 0
+                    ? ` (${preview.admins} administrator${preview.admins === 1 ? "" : "s"})`
+                    : ""}
+                </li>
+              ))}
+              {preview.generatedAt && <li>Taken {preview.generatedAt.slice(0, 10)}</li>}
+              {preview.sourceProvider && (
+                <li>
+                  From {preview.sourceProvider}
+                  {preview.sourceProvider !== preview.targetProvider
+                    ? ` → restoring into ${preview.targetProvider}`
+                    : ""}
+                </li>
+              )}
+              {preview.warnings.map((w) => (
+                <li key={w} className="text-amber-700 dark:text-amber-300">
+                  {w}
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+
+        <Notice message={message} />
+
+        {done ? (
+          <a href="/login" className={primaryButton}>
+            Sign in again
+          </a>
+        ) : (
+          <div className="flex flex-wrap items-center gap-3">
+            <button onClick={pickFile} disabled={busy !== null} className={secondaryButton}>
+              {busy === "inspect" ? "Reading…" : preview ? "Choose a different file…" : "Choose backup file…"}
+            </button>
+            {preview && (
+              <button
+                onClick={commit}
+                disabled={busy !== null}
+                className="rounded-lg bg-[var(--danger)] px-4 py-2 text-sm font-medium text-white transition hover:bg-[var(--danger-hover)] disabled:opacity-50"
+              >
+                {busy === "restore" ? "Restoring…" : "Replace all data with this backup"}
+              </button>
+            )}
+          </div>
+        )}
+      </div>
+    </Section>
+  );
+}
+
 /* ─────────────── Page ─────────────── */
 
 export default function SettingsPage() {
@@ -694,8 +1300,11 @@ export default function SettingsPage() {
         ) : (
           <>
             <AccountSection user={user} />
+            <AiSection user={user} />
             {user.role === "admin" && <UsersSection currentUser={user} />}
             {user.role === "admin" && <DatabaseSection />}
+            {user.role === "admin" && <BackupSection />}
+            {user.role === "admin" && <RestoreSection />}
           </>
         )}
       </main>

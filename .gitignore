@@ -15,6 +15,10 @@ tsconfig.tsbuildinfo
 # Runtime DB configuration (may contain external DB credentials)
 data/db-config.json
 
+# Generated key that encrypts stored AI provider API keys. Losing it means
+# every user must re-enter their key; leaking it defeats the encryption.
+data/encryption.key
+
 # Local environment files — these hold DATABASE_URL, which contains the
 # database password in plain text. Never commit them.
 .env

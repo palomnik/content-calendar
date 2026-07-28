@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { isTestModeEnabled } from "./app/lib/testMode";
 
 // Edge-runtime gate. This is an *optimistic* check only — it looks for the
 // presence of a session cookie so unauthenticated visitors land on /login
@@ -20,10 +21,25 @@ const PUBLIC_PATHS = new Set([
   "/api/auth/setup",
 ]);
 
+// Test mode: a database-free trial of the app. These pages keep their data in
+// the visitor's own tab, and the routes take the AI connection from the request
+// body, so they can neither read nor write the database and can only ever spend
+// a key the caller supplied themselves. Public only while ENABLE_TEST_MODE is
+// set; the pages and routes enforce the same flag themselves.
+const TEST_MODE_PATHS = new Set([
+  "/test",
+  "/test/settings",
+  "/api/llm/providers",
+  "/api/llm/test-connection",
+  "/api/llm/test-generate",
+  "/api/llm/test-brainstorm",
+]);
+
 export function middleware(req: NextRequest) {
   const { pathname, search } = req.nextUrl;
 
   if (PUBLIC_PATHS.has(pathname)) return NextResponse.next();
+  if (isTestModeEnabled() && TEST_MODE_PATHS.has(pathname)) return NextResponse.next();
 
   const hasSession = Boolean(req.cookies.get(SESSION_COOKIE)?.value);
   if (hasSession) return NextResponse.next();

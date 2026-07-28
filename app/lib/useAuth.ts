@@ -36,11 +36,16 @@ export function redirectToLogin(): void {
  * lets pages render a real identity. Data access is still authorized
  * server-side on every request; this hook is for the UI, not for security.
  */
-export function useAuth(): { user: SessionUser | null; loading: boolean } {
+export function useAuth(
+  /** Skip the lookup entirely — test mode has no session and must not be
+   *  bounced to the login page. */
+  skip = false
+): { user: SessionUser | null; loading: boolean } {
   const [user, setUser] = useState<SessionUser | null>(null);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(!skip);
 
   useEffect(() => {
+    if (skip) return;
     let cancelled = false;
 
     fetch("/api/auth/status")
@@ -61,9 +66,21 @@ export function useAuth(): { user: SessionUser | null; loading: boolean } {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [skip]);
 
   return { user, loading };
+}
+
+/**
+ * Hard-navigate to a page in this app.
+ *
+ * A full load is intentional when leaving a session or a test session: a
+ * client-side push would keep the router cache and React state belonging to
+ * whoever was just here.
+ */
+export function leaveTo(path: string): void {
+  // eslint-disable-next-line @next/next/no-location-assign-relative-destination
+  window.location.assign(sameOrigin(path));
 }
 
 export async function signOut(): Promise<void> {

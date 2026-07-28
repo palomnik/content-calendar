@@ -51,9 +51,35 @@ body {
   -moz-osx-font-smoothing: grayscale;
 }
 
+/* iOS/iPadOS: stop the whole document rubber-banding behind the fixed app shell. */
+html,
+body {
+  overscroll-behavior: none;
+}
+
+/* Full-viewport app shell. 100dvh tracks Safari's collapsing URL bar so the
+   board never extends past the visible viewport; 100vh is the fallback. */
+.app-shell {
+  height: 100vh;
+  height: 100dvh;
+  padding-left: env(safe-area-inset-left);
+  padding-right: env(safe-area-inset-right);
+  padding-bottom: env(safe-area-inset-bottom);
+}
+
+/* Modal panels use the dynamic viewport too, so they stay reachable on iOS. */
+.modal-panel {
+  max-height: 85vh;
+  max-height: 85dvh;
+}
+
 /* Kanban horizontal scroll */
+.kanban-scroll {
+  -webkit-overflow-scrolling: touch;
+}
 .kanban-scroll::-webkit-scrollbar {
   height: 6px;
+  width: 6px;
 }
 .kanban-scroll::-webkit-scrollbar-track {
   background: transparent;
@@ -64,6 +90,32 @@ body {
 }
 .kanban-scroll::-webkit-scrollbar-thumb:hover {
   background: var(--muted);
+}
+
+/* Kanban cards double as drag handles. Suppress the iOS long-press callout,
+   text selection and the 300ms double-tap-zoom delay, but leave panning alone
+   so a swipe across a card still scrolls the board. */
+.kanban-card {
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
+  user-select: none;
+  touch-action: manipulation;
+}
+
+body.dragging-card {
+  -webkit-user-select: none;
+  user-select: none;
+  cursor: grabbing;
+}
+
+/* iOS zooms the viewport when a focused field is under 16px, which shoves the
+   layout off screen. Bump form controls on touch devices only. */
+@media (pointer: coarse) {
+  input:not([type="checkbox"]):not([type="radio"]),
+  select,
+  textarea {
+    font-size: 16px;
+  }
 }
 
 /* Skeleton shimmer */

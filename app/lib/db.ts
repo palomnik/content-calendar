@@ -19,6 +19,15 @@
 import { join } from "path";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 
+import { decryptSecret, encryptSecret } from "./crypto";
+import { BACKUP_TABLES, ParsedBackup, sqlLiteral } from "./backup";
+import {
+  EDITABLE_ITEM_FIELDS,
+  ITEM_COLUMNS,
+  ITEM_FIELD_MAP,
+  ITEM_FIELDS,
+} from "./fields";
+
 export type Provider = "sqlite" | "mysql" | "mariadb" | "postgres";
 
 // How to treat TLS on the connection. Mirrors libpq's sslmode semantics, which
@@ -245,47 +254,17 @@ export function publicConfig(config: DbConfig = readConfig()) {
 
 /* ─────────────── Shared shape ─────────────── */
 
-const COLUMNS = [
-  "id", "created_at", "updated_at", "headline", "description", "format",
-  "keywords", "target_reader", "platform", "internal_links", "external_links",
-  "word_count", "content_status", "due_date", "publish_date", "writer",
-  "promotion_plan", "smes", "gdrive_link", "notes",
-];
+// Derived from app/lib/fields.ts so the CSV, the INSERT, and the row
+// conversion can never disagree about the field list again.
+const COLUMNS = ITEM_COLUMNS;
 
 // camelCase (API/UI) → snake_case (columns) for the editable fields.
-const FIELD_MAP: Record<string, string> = {
-  headline: "headline", description: "description", format: "format",
-  keywords: "keywords", targetReader: "target_reader", platform: "platform",
-  internalLinks: "internal_links", externalLinks: "external_links",
-  wordCount: "word_count", contentStatus: "content_status",
-  dueDate: "due_date", publishDate: "publish_date", writer: "writer",
-  promotionPlan: "promotion_plan", smes: "smes", gdriveLink: "gdrive_link",
-  notes: "notes",
-};
+const FIELD_MAP: Record<string, string> = ITEM_FIELD_MAP;
 
 export function rowToItem(row: any): any {
-  return {
-    id: row.id,
-    createdAt: row.created_at,
-    updatedAt: row.updated_at,
-    headline: row.headline,
-    description: row.description,
-    format: row.format,
-    keywords: row.keywords,
-    targetReader: row.target_reader,
-    platform: row.platform,
-    internalLinks: row.internal_links,
-    externalLinks: row.external_links,
-    wordCount: row.word_count,
-    contentStatus: row.content_status,
-    dueDate: row.due_date,
-    publishDate: row.publish_date,
-    writer: row.writer,
-    promotionPlan: row.promotion_plan,
-    smes: row.smes,
-    gdriveLink: row.gdrive_link,
-    notes: row.notes,
-  };
+  const item: Record<string, any> = {};
+  for (const field of ITEM_FIELDS) item[field.key] = row[field.column] ?? null;
+  return item;
 }
 
 function generateId(): string {
@@ -297,10 +276,22 @@ function generateId(): string {
 
 /* ─────────────── Adapter interface ─────────────── */
 
+/** Execute one statement. `select` true → return rows. */
+type RunFn = (sql: string, params: any[], select: boolean) => Promise<any[]>;
+
 interface Adapter {
   init(): Promise<void>;
-  // Execute a statement. `select` true → return rows.
-  run(sql: string, params: any[], select: boolean): Promise<any[]>;
+  run: RunFn;
+  /**
+   * Run `work` with every statement pinned to one connection, committing on
+   * success and rolling back on any throw.
+   *
+   * This cannot be built from run() alone: the MySQL and Postgres adapters go
+   * through a pool, so a BEGIN issued by one run() call and an INSERT issued by
+   * the next can land on different connections, leaving the BEGIN dangling and
+   * the writes uncommitted-but-unprotected.
+   */
+  transaction<T>(work: (run: RunFn) => Promise<T>): Promise<T>;
 }
 
 // Each statement is executed separately — MySQL/Postgres drivers reject
@@ -313,6 +304,11 @@ function ddlStatements(provider: Provider): string[] {
   const shortType = provider === "sqlite" ? "TEXT" : "VARCHAR(64)";
   // Usernames are indexed UNIQUE; MySQL needs a bounded length for that.
   const nameType = provider === "sqlite" ? "TEXT" : "VARCHAR(190)";
+  // MySQL's TEXT holds only 65,535 *bytes* and truncates silently past that.
+  // The free-text fields hold AI-generated drafts, which run far longer, so
+  // they get LONGTEXT there. SQLite and Postgres TEXT are already unbounded.
+  const longTextType =
+    provider === "mysql" || provider === "mariadb" ? "LONGTEXT" : "TEXT";
 
   return [
     `
@@ -321,7 +317,7 @@ function ddlStatements(provider: Provider): string[] {
       created_at ${shortType},
       updated_at ${shortType},
       headline TEXT NOT NULL,
-      description TEXT,
+      description ${longTextType},
       format TEXT,
       keywords TEXT,
       target_reader TEXT,
@@ -333,10 +329,10 @@ function ddlStatements(provider: Provider): string[] {
       due_date ${shortType},
       publish_date ${shortType},
       writer TEXT,
-      promotion_plan TEXT,
+      promotion_plan ${longTextType},
       smes TEXT,
       gdrive_link TEXT,
-      notes TEXT
+      notes ${longTextType}
     )
   `,
     `
@@ -356,6 +352,30 @@ function ddlStatements(provider: Provider): string[] {
       user_id ${idType} NOT NULL,
       created_at ${shortType},
       expires_at ${shortType}
+    )
+  `,
+    // One row per user, plus one for the team default (user_id = "__org__").
+    //
+    // Deliberately no UNIQUE(user_id) and no index. There is no migration
+    // system here — every statement is CREATE TABLE IF NOT EXISTS — so a
+    // constraint added now could never be dropped from a deployed database,
+    // which would block a future "several connections per user" feature.
+    // CREATE INDEX IF NOT EXISTS is also not valid MySQL, and inline INDEX(...)
+    // is MySQL-only. The table holds one row per account, so a scan is free.
+    // Uniqueness is enforced in upsertLlmConnection instead.
+    //
+    // api_key holds AES-256-GCM ciphertext (see app/lib/crypto.ts) and must be
+    // TEXT: an encrypted long key runs to several hundred characters.
+    `
+    CREATE TABLE IF NOT EXISTS llm_connections (
+      id ${idType} PRIMARY KEY,
+      user_id ${idType} NOT NULL,
+      created_at ${shortType},
+      updated_at ${shortType},
+      provider ${shortType} NOT NULL,
+      api_key TEXT,
+      base_url TEXT,
+      model TEXT
     )
   `,
   ];
@@ -417,6 +437,25 @@ class SqliteAdapter implements Adapter {
     stmt.run(...params);
     return [];
   }
+
+  async transaction<T>(work: (run: RunFn) => Promise<T>): Promise<T> {
+    await this.init();
+    // better-sqlite3 holds a single connection, so the ambient one is correct.
+    // Its own db.transaction() helper only wraps synchronous callbacks.
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const result = await work((sql, params, select) => this.run(sql, params, select));
+      this.db.exec("COMMIT");
+      return result;
+    } catch (e) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {
+        /* the transaction was already unwound */
+      }
+      throw e;
+    }
+  }
 }
 
 /* ---- MySQL / MariaDB (mysql2/promise) ---- */
@@ -445,6 +484,29 @@ class MysqlAdapter implements Adapter {
     await this.init();
     const [rows] = await this.pool.execute(sql, params);
     return select ? (rows as any[]) : [];
+  }
+
+  async transaction<T>(work: (run: RunFn) => Promise<T>): Promise<T> {
+    await this.init();
+    const conn = await this.pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      const result = await work(async (sql, params, select) => {
+        const [rows] = await conn.execute(sql, params);
+        return select ? (rows as any[]) : [];
+      });
+      await conn.commit();
+      return result;
+    } catch (e) {
+      try {
+        await conn.rollback();
+      } catch {
+        /* connection already gone */
+      }
+      throw e;
+    } finally {
+      conn.release();
+    }
   }
 }
 
@@ -479,6 +541,29 @@ class PostgresAdapter implements Adapter {
     await this.init();
     const res = await this.pool.query(this.toPg(sql), params);
     return select ? res.rows : [];
+  }
+
+  async transaction<T>(work: (run: RunFn) => Promise<T>): Promise<T> {
+    await this.init();
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const result = await work(async (sql, params, select) => {
+        const res = await client.query(this.toPg(sql), params);
+        return select ? res.rows : [];
+      });
+      await client.query("COMMIT");
+      return result;
+    } catch (e) {
+      try {
+        await client.query("ROLLBACK");
+      } catch {
+        /* connection already gone */
+      }
+      throw e;
+    } finally {
+      client.release();
+    }
   }
 }
 
@@ -542,25 +627,16 @@ export async function createItem(data: any): Promise<any> {
   await db.run(
     `INSERT INTO content_items (${COLUMNS.join(", ")})
      VALUES (${COLUMNS.map(() => "?").join(", ")})`,
+    // Built from the same list as COLUMNS, so the two cannot fall out of step.
     [
-      id, now, now,
-      data.headline ?? null,
-      data.description ?? null,
-      data.format ?? null,
-      data.keywords ?? null,
-      data.targetReader ?? null,
-      data.platform ?? null,
-      data.internalLinks ?? null,
-      data.externalLinks ?? null,
-      data.wordCount ?? null,
-      data.contentStatus ?? "Brainstormed",
-      data.dueDate ?? null,
-      data.publishDate ?? null,
-      data.writer ?? null,
-      data.promotionPlan ?? null,
-      data.smes ?? null,
-      data.gdriveLink ?? null,
-      data.notes ?? null,
+      id,
+      now,
+      now,
+      ...EDITABLE_ITEM_FIELDS.map((field) =>
+        field.key === "contentStatus"
+          ? data.contentStatus ?? "Brainstormed"
+          : data[field.key] ?? null
+      ),
     ],
     false
   );
@@ -746,6 +822,8 @@ export async function deleteUser(id: string): Promise<boolean> {
   const existing = await findUserById(id);
   if (!existing) return false;
   await db.run("DELETE FROM sessions WHERE user_id = ?", [id], false);
+  // Real user ids never equal ORG_CONNECTION_ID, so the team default survives.
+  await db.run("DELETE FROM llm_connections WHERE user_id = ?", [id], false);
   await db.run("DELETE FROM users WHERE id = ?", [id], false);
   return true;
 }
@@ -809,6 +887,352 @@ export async function purgeExpiredSessions(): Promise<void> {
     [new Date().toISOString()],
     false
   );
+}
+
+/* ─────────────── LLM connections ─────────────── */
+
+// Each user configures their own model provider. An admin may also save a team
+// default that users inherit until they set one of their own; it lives in the
+// same table under a sentinel user id.
+//
+// api_key holds ciphertext. Plaintext keys exist only in memory, on the server,
+// for the life of a request — they are never returned to a browser and never
+// logged. Use publicLlmConnection() for anything that leaves the server.
+
+/** Sentinel user id for the admin-managed team default. Real ids come from
+ *  generateId(), which never produces underscores, so this cannot collide. */
+export const ORG_CONNECTION_ID = "__org__";
+
+export type LlmProviderId =
+  | "anthropic"
+  | "openai"
+  | "openrouter"
+  | "ollama-cloud"
+  | "ollama"
+  | "huggingface"
+  | "openai-compatible";
+
+const LLM_PROVIDER_IDS: LlmProviderId[] = [
+  "anthropic",
+  "openai",
+  "openrouter",
+  "ollama-cloud",
+  "ollama",
+  "huggingface",
+  "openai-compatible",
+];
+
+export interface LlmConnectionRow {
+  id: string;
+  userId: string;
+  provider: LlmProviderId;
+  /** Decrypted key, or null when absent or unreadable. Never send to a browser. */
+  apiKey: string | null;
+  /** True when a stored key exists but the current encryption key cannot open it. */
+  apiKeyBroken: boolean;
+  baseUrl: string | null;
+  model: string | null;
+  createdAt: string | null;
+  updatedAt: string | null;
+}
+
+function rowToLlmConnection(row: any): LlmConnectionRow {
+  const provider: LlmProviderId = LLM_PROVIDER_IDS.includes(row.provider)
+    ? row.provider
+    : "openai-compatible";
+
+  let apiKey: string | null = null;
+  let apiKeyBroken = false;
+  if (row.api_key) {
+    try {
+      apiKey = decryptSecret(row.api_key, row.user_id);
+    } catch {
+      // Rotated or missing APP_ENCRYPTION_KEY, or a corrupted row. Surface it
+      // as "enter your key again" rather than failing the whole request.
+      apiKeyBroken = true;
+    }
+  }
+
+  return {
+    id: row.id,
+    userId: row.user_id,
+    provider,
+    apiKey,
+    apiKeyBroken,
+    baseUrl: row.base_url ?? null,
+    model: row.model ?? null,
+    createdAt: row.created_at ?? null,
+    updatedAt: row.updated_at ?? null,
+  };
+}
+
+/** Redacted shape safe to hand to a browser. Mirrors publicConfig(). */
+export function publicLlmConnection(conn: LlmConnectionRow) {
+  return {
+    provider: conn.provider,
+    baseUrl: conn.baseUrl,
+    model: conn.model,
+    hasApiKey: Boolean(conn.apiKey),
+    apiKeyBroken: conn.apiKeyBroken,
+    updatedAt: conn.updatedAt,
+  };
+}
+
+export async function getLlmConnection(
+  userId: string
+): Promise<LlmConnectionRow | null> {
+  const db = await getAdapter();
+  // Newest wins, so behaviour stays deterministic even if a duplicate ever
+  // slipped in before upsert converged.
+  const rows = await db.run(
+    "SELECT * FROM llm_connections WHERE user_id = ? ORDER BY updated_at DESC",
+    [userId],
+    true
+  );
+  return rows[0] ? rowToLlmConnection(rows[0]) : null;
+}
+
+/** The admin-managed team default, if one has been saved. */
+export function getOrgLlmConnection(): Promise<LlmConnectionRow | null> {
+  return getLlmConnection(ORG_CONNECTION_ID);
+}
+
+/** The connection a given user actually generates with, and where it came from. */
+export async function resolveLlmConnection(
+  userId: string
+): Promise<{ connection: LlmConnectionRow; source: "user" | "org" } | null> {
+  const own = await getLlmConnection(userId);
+  if (own) return { connection: own, source: "user" };
+  const org = await getOrgLlmConnection();
+  return org ? { connection: org, source: "org" } : null;
+}
+
+export async function upsertLlmConnection(
+  userId: string,
+  data: {
+    provider: LlmProviderId;
+    /** undefined keeps the stored key; null or "" clears it; a string replaces it. */
+    apiKey?: string | null;
+    baseUrl?: string | null;
+    model?: string | null;
+  }
+): Promise<LlmConnectionRow> {
+  const db = await getAdapter();
+  const now = new Date().toISOString();
+  const existing = await getLlmConnection(userId);
+
+  let cipher: string | null;
+  if (data.apiKey === undefined) {
+    // Reuse the stored ciphertext verbatim rather than re-encrypting, so this
+    // path works even when the key cannot currently be decrypted.
+    const rows = await db.run(
+      "SELECT api_key FROM llm_connections WHERE user_id = ?",
+      [userId],
+      true
+    );
+    cipher = rows[0]?.api_key ?? null;
+  } else if (data.apiKey) {
+    cipher = encryptSecret(data.apiKey, userId);
+  } else {
+    cipher = null;
+  }
+
+  if (existing) {
+    await db.run(
+      `UPDATE llm_connections
+          SET provider = ?, api_key = ?, base_url = ?, model = ?, updated_at = ?
+        WHERE id = ?`,
+      [
+        data.provider,
+        cipher,
+        data.baseUrl ?? null,
+        data.model ?? null,
+        now,
+        existing.id,
+      ],
+      false
+    );
+    // Converge on one row per user without needing a UNIQUE constraint.
+    await db.run(
+      "DELETE FROM llm_connections WHERE user_id = ? AND id <> ?",
+      [userId, existing.id],
+      false
+    );
+  } else {
+    const id = generateId();
+    await db.run(
+      `INSERT INTO llm_connections
+         (id, user_id, created_at, updated_at, provider, api_key, base_url, model)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        id,
+        userId,
+        now,
+        now,
+        data.provider,
+        cipher,
+        data.baseUrl ?? null,
+        data.model ?? null,
+      ],
+      false
+    );
+  }
+
+  const saved = await getLlmConnection(userId);
+  if (!saved) throw new Error("Failed to save the AI connection.");
+  return saved;
+}
+
+export async function deleteLlmConnection(userId: string): Promise<boolean> {
+  const db = await getAdapter();
+  const existing = await getLlmConnection(userId);
+  if (!existing) return false;
+  await db.run("DELETE FROM llm_connections WHERE user_id = ?", [userId], false);
+  return true;
+}
+
+/* ─────────────── SQL backup ─────────────── */
+
+// A portable dump of the active database: schema, then data.
+//
+// `sessions` is deliberately excluded. Sessions are short-lived credentials,
+// not content — restoring them would resurrect sign-ins that were meant to have
+// expired, and everyone simply signs in again after a restore.
+//
+// Everything else IS included, which means a backup file contains password
+// hashes and encrypted API keys. It is not safe to share, and the API keys are
+// only readable again by a server holding the same APP_ENCRYPTION_KEY.
+
+/** Rows read per round trip, so a large board never lands in memory at once. */
+const BACKUP_BATCH = 500;
+
+/**
+ * Render a value as a SQL literal.
+ *
+ * MySQL treats a backslash as an escape character inside string literals, so a
+ * Windows path or a regex in someone's notes would come back mangled without
+ * this. SQLite and Postgres take backslashes literally.
+ */
+/**
+ * Stream a SQL dump of the active database.
+ *
+ * Yielded in chunks rather than returned whole so a board with long AI drafts
+ * does not have to be buffered in memory before the download starts.
+ */
+export async function* generateSqlBackup(): AsyncGenerator<string> {
+  const db = await getAdapter();
+  const { provider } = readConfig();
+  const now = new Date().toISOString();
+
+  yield [
+    `-- Content Calendar backup`,
+    `-- Generated: ${now}`,
+    `-- Source database: ${provider}`,
+    `--`,
+    `-- Contains password hashes and encrypted AI provider keys. Treat this file`,
+    `-- as a secret. The API keys can only be decrypted by a server using the`,
+    `-- same APP_ENCRYPTION_KEY; without it they are unreadable and each user`,
+    `-- must enter their key again after a restore.`,
+    `--`,
+    `-- Active sessions are not included: everyone signs in again after a restore.`,
+    `--`,
+    `-- Restore into an EMPTY database, e.g.`,
+    `--   sqlite3 content_calendar.db < this-file.sql`,
+    `--   psql "$DATABASE_URL" -f this-file.sql`,
+    `--   mysql -u user -p dbname < this-file.sql`,
+    `--`,
+    `-- Restoring over a database that already holds rows will fail on duplicate`,
+    `-- primary keys. Empty the tables first if that is what you intend.`,
+    ``,
+    ``,
+  ].join("\n");
+
+  // Schema first, so the file restores into a blank database on its own.
+  yield `-- ─────────── Schema ───────────\n\n`;
+  for (const statement of ddlStatements(provider)) {
+    yield `${statement.trim()};\n\n`;
+  }
+
+  for (const table of BACKUP_TABLES) {
+    const countRows = await db.run(`SELECT COUNT(*) AS n FROM ${table.name}`, [], true);
+    const total = Number(countRows[0]?.n ?? countRows[0]?.count ?? 0);
+
+    yield `\n-- ─────────── Data: ${table.name} (${total} row${total === 1 ? "" : "s"}) ───────────\n\n`;
+    if (total === 0) continue;
+
+    const columnList = table.columns.join(", ");
+    for (let offset = 0; offset < total; offset += BACKUP_BATCH) {
+      // Ordered so the batches partition the table deterministically.
+      const rows = await db.run(
+        `SELECT ${columnList} FROM ${table.name} ORDER BY id LIMIT ${BACKUP_BATCH} OFFSET ${offset}`,
+        [],
+        true
+      );
+      let chunk = "";
+      for (const row of rows) {
+        const values = table.columns
+          .map((column) => sqlLiteral(row[column], provider))
+          .join(", ");
+        chunk += `INSERT INTO ${table.name} (${columnList}) VALUES (${values});\n`;
+      }
+      yield chunk;
+    }
+  }
+
+  yield `\n-- End of backup\n`;
+}
+
+export interface RestoreResult {
+  /** Rows written, per table. */
+  inserted: Record<string, number>;
+  total: number;
+}
+
+/**
+ * Replace the contents of the backed-up tables with a parsed backup.
+ *
+ * Everything happens inside one transaction: on any failure the database is
+ * left exactly as it was. That matters more here than anywhere else in the app,
+ * because the first thing a restore does is delete every existing row.
+ *
+ * Rows are written with parameterised queries rather than by executing the
+ * uploaded file, so a backup taken from any provider restores into any other —
+ * values travel as parameters and never have to survive a second round of
+ * dialect-specific quoting.
+ */
+export async function restoreSqlBackup(parsed: ParsedBackup): Promise<RestoreResult> {
+  const db = await getAdapter();
+  const inserted: Record<string, number> = {};
+
+  return db.transaction(async (run) => {
+    // Sessions go too: the accounts they point at are about to be replaced, so
+    // every existing sign-in is meaningless. Everyone signs in again.
+    for (const table of [...BACKUP_TABLES].reverse()) {
+      await run(`DELETE FROM ${table.name}`, [], false);
+    }
+    await run("DELETE FROM sessions", [], false);
+
+    let total = 0;
+    for (const table of BACKUP_TABLES) {
+      const rows = parsed.tables[table.name] ?? [];
+      inserted[table.name] = 0;
+      if (!rows.length) continue;
+
+      const placeholders = table.columns.map(() => "?").join(", ");
+      const sql = `INSERT INTO ${table.name} (${table.columns.join(", ")}) VALUES (${placeholders})`;
+
+      for (const row of rows) {
+        const values = table.columns.map((column) =>
+          row[column] === undefined ? null : row[column]
+        );
+        await run(sql, values, false);
+        inserted[table.name]++;
+        total++;
+      }
+    }
+
+    return { inserted, total };
+  });
 }
 
 /* ─────────────── Connection test ─────────────── */

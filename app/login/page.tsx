@@ -26,6 +26,7 @@ function currentNext(): string {
 export default function LoginPage() {
   const [mode, setMode] = useState<"loading" | "login" | "setup">("loading");
   const [tokenRequired, setTokenRequired] = useState(false);
+  const [testModeEnabled, setTestMode] = useState(false);
   const [next, setNext] = useState("/");
 
   const [username, setUsername] = useState("");
@@ -49,6 +50,7 @@ export default function LoginPage() {
           return;
         }
         setTokenRequired(Boolean(status.setupTokenRequired));
+        setTestMode(Boolean(status.testModeEnabled));
         setMode(status.needsSetup ? "setup" : "login");
       })
       .catch(() => {
@@ -233,7 +235,35 @@ export default function LoginPage() {
                 : "Sign in"}
           </button>
         </form>
+
+        {/* Try the app without an account, and without a database. */}
+        {testModeEnabled && (
+        <div className="mt-6 border-t border-[var(--border)] pt-6">
+          <a
+            href="/test"
+            className="block w-full rounded-lg border border-[var(--border)] px-4 py-2 text-center text-sm font-medium text-[var(--foreground)] transition hover:bg-[var(--surface)]"
+          >
+            ✦ Try test mode
+          </a>
+          <p className="mt-2 text-center text-xs text-[var(--muted)]">
+            Explore the board and the AI features with your own API key. No sign-in,
+            and no database is read or written.
+          </p>
+        </div>
+        )}
       </div>
+
+      {testModeEnabled && (
+      <div
+        role="status"
+        className="pointer-events-none fixed inset-x-0 bottom-0 z-[90] border-t border-amber-300 bg-amber-50/95 px-4 py-2.5 text-center text-xs text-amber-900 backdrop-blur-sm dark:border-amber-800 dark:bg-[#2e2618]/95 dark:text-amber-200"
+        style={{ paddingBottom: "calc(0.625rem + env(safe-area-inset-bottom))" }}
+      >
+        <span className="font-semibold">Test mode saves nothing.</span> Anything you
+        create there is discarded when the tab closes — use{" "}
+        <span className="font-semibold">Export CSV</span> to keep it.
+      </div>
+      )}
     </div>
   );
 }

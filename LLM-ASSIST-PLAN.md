@@ -1,9 +1,30 @@
 # LLM Content Assistant — Proposal & Plan
 
-> **Status: proposal only.** This document plans and suggests an LLM-powered
-> assistant for the Content Calendar. Per the V2 spec, **no implementation is
-> included** — this is the design to review and approve before any code is
-> written.
+> **Status: superseded. Kept for the reasoning, not as a description of the
+> code.** A different design was built. Where the two disagree, the shipped
+> behaviour below is correct.
+>
+> | This proposal | What shipped |
+> |---|---|
+> | A chat panel with message history | One-shot buttons on Kanban cards |
+> | One global API key in `data/assist-config.json` | A key per user in the `llm_connections` table, AES-256-GCM encrypted, plus an optional admin-set team default |
+> | Anthropic only, pluggable later | Anthropic, OpenAI, OpenRouter, Ollama, Hugging Face, and any OpenAI-compatible endpoint, from the start |
+> | Assist button inside the edit modal | Buttons on Brainstormed and Outlined cards; generation streams into its own modal |
+> | Suggestions copied into fields by hand | Output appended to `notes` under a dated heading after the user accepts it |
+> | Six status-specific assistant roles | Two: outline (Brainstormed) and draft (Outlined) |
+>
+> Carried over intact: server-side only, streamed responses, keys redacted on
+> read, and never auto-changing an item's status.
+>
+> Implementation lives in `app/lib/{llm,crypto,prompts}.ts`, `app/api/llm/*`,
+> and the AI sections of `app/page.tsx` and `app/settings/page.tsx`.
+
+---
+
+> **Original status: proposal only.** This document plans and suggests an
+> LLM-powered assistant for the Content Calendar. Per the V2 spec, **no
+> implementation is included** — this is the design to review and approve before
+> any code is written.
 
 ## 1. Goal
 
