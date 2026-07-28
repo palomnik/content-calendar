@@ -3,8 +3,10 @@
 import { useEffect, useState, useCallback, useRef } from "react";
 import Link from "next/link";
 import { exportCsv, parseCsv, browserDownload } from "./lib/sqlite";
+import { buildIcs, countIcsEvents } from "./lib/ics";
 import { clearTestSession, liveStore, testStore } from "./lib/store";
 import { leaveTo, signOut, useAuth } from "./lib/useAuth";
+import MonthCalendar from "./MonthCalendar";
 
 interface ContentItem {
   id: string;
@@ -836,6 +838,21 @@ export default function Board({ testMode = false }: { testMode?: boolean }) {
     }
   };
 
+  // Exports every item, not just the search matches: an .ics dropped into
+  // Google or Apple Calendar is expected to be the whole calendar, and a
+  // stray search term silently truncating it would be a nasty surprise.
+  const handleExportIcs = () => {
+    try {
+      const ics = buildIcs(items, "Content Calendar");
+      const fileName = `content_calendar_${new Date().toISOString().slice(0, 10)}.ics`;
+      browserDownload(ics, fileName, "text/calendar;charset=utf-8");
+      show("Calendar file downloaded", "success");
+    } catch (e: any) {
+      setError(String(e));
+      show("Calendar export failed", "error");
+    }
+  };
+
   const handleImportCsv = async (csvText: string) => {
     try {
       const rows = parseCsv(csvText);
@@ -912,6 +929,8 @@ export default function Board({ testMode = false }: { testMode?: boolean }) {
     if (undated.length) groups.push({ label: "No due date", records: undated });
     return groups;
   })();
+
+  const icsEventCount = countIcsEvents(items);
 
   // Status view: group by status in workflow order. Only statuses with
   // records appear.
@@ -1215,7 +1234,25 @@ export default function Board({ testMode = false }: { testMode?: boolean }) {
       {/* ── Date View ── */}
       {view === "date" && (
         <main className="kanban-scroll min-h-0 flex-1 overflow-y-auto overscroll-contain p-4 md:p-6">
-          <div className="mx-auto max-w-3xl">
+          {/* Wider than the other list view: the month grid divides into seven
+              columns, and at max-w-3xl every headline truncates to nothing. */}
+          <div className="mx-auto max-w-5xl">
+            <MonthCalendar
+              items={filtered}
+              onOpen={openEdit}
+              statusDot={(status) =>
+                (STATUS_COLORS[status] || STATUS_COLORS.Brainstormed).dot
+              }
+              action={
+                <button
+                  onClick={handleExportIcs}
+                  title={`Download all ${icsEventCount} calendar events as an .ics file`}
+                  className="rounded-md border border-[var(--border)] px-2.5 py-1 text-xs font-medium text-[var(--foreground)] transition hover:bg-[var(--surface)] active:bg-[var(--surface-hover)]"
+                >
+                  ⤓ Download .ics
+                </button>
+              }
+            />
             {dateGroups.length === 0 ? (
               <EmptyState />
             ) : (
