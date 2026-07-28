@@ -4,8 +4,8 @@ import { isTestModeEnabled } from "../lib/testMode";
 
 /**
  * Test mode: the same board, backed by this browser tab instead of the
- * database. Reachable without signing in, and only when ENABLE_TEST_MODE is
- * set — see app/lib/testMode.ts for why it is off by default.
+ * database. Reachable without signing in, and available unless a host sets
+ * ENABLE_TEST_MODE=false — see app/lib/testMode.ts for what that default costs.
  */
 // Read the flag per request, not at build time. Next would otherwise
 // prerender this page during `next build` and bake in whichever answer the

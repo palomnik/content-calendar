@@ -55,6 +55,11 @@ export default function LoginPage() {
       })
       .catch(() => {
         setError("Could not reach the server. Check the database configuration.");
+        // Status usually fails because the database is unreachable — which is
+        // exactly when the database-free trial is worth offering. Show the
+        // button and let /test decide: it 404s if the flag really is off, so
+        // guessing wrong costs a dead link, not an exposed route.
+        setTestMode(true);
         setMode("login");
       });
   }, []);

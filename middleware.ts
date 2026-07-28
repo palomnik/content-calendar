@@ -24,8 +24,8 @@ const PUBLIC_PATHS = new Set([
 // Test mode: a database-free trial of the app. These pages keep their data in
 // the visitor's own tab, and the routes take the AI connection from the request
 // body, so they can neither read nor write the database and can only ever spend
-// a key the caller supplied themselves. Public only while ENABLE_TEST_MODE is
-// set; the pages and routes enforce the same flag themselves.
+// a key the caller supplied themselves. Public unless ENABLE_TEST_MODE is set
+// to false; the pages and routes enforce the same flag themselves.
 const TEST_MODE_PATHS = new Set([
   "/test",
   "/test/settings",
