@@ -133,6 +133,8 @@ function normalizeTestItem(data: any, existing?: any): any {
     smes: null,
     gdriveLink: null,
     notes: null,
+    contextFileName: null,
+    contextFile: null,
     ...(existing ?? {}),
     ...supplied,
     id: existing?.id ?? testId(),

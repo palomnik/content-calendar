@@ -294,6 +294,14 @@ interface Adapter {
   transaction<T>(work: (run: RunFn) => Promise<T>): Promise<T>;
 }
 
+// MySQL's TEXT holds only 65,535 *bytes* and truncates silently past that.
+// The free-text fields hold AI-generated drafts and uploaded context files,
+// which run far longer, so they get LONGTEXT there. SQLite and Postgres TEXT
+// are already unbounded.
+function longText(provider: Provider): string {
+  return provider === "mysql" || provider === "mariadb" ? "LONGTEXT" : "TEXT";
+}
+
 // Each statement is executed separately — MySQL/Postgres drivers reject
 // multi-statement strings by default.
 function ddlStatements(provider: Provider): string[] {
@@ -304,11 +312,7 @@ function ddlStatements(provider: Provider): string[] {
   const shortType = provider === "sqlite" ? "TEXT" : "VARCHAR(64)";
   // Usernames are indexed UNIQUE; MySQL needs a bounded length for that.
   const nameType = provider === "sqlite" ? "TEXT" : "VARCHAR(190)";
-  // MySQL's TEXT holds only 65,535 *bytes* and truncates silently past that.
-  // The free-text fields hold AI-generated drafts, which run far longer, so
-  // they get LONGTEXT there. SQLite and Postgres TEXT are already unbounded.
-  const longTextType =
-    provider === "mysql" || provider === "mariadb" ? "LONGTEXT" : "TEXT";
+  const longTextType = longText(provider);
 
   return [
     `
@@ -332,7 +336,9 @@ function ddlStatements(provider: Provider): string[] {
       promotion_plan ${longTextType},
       smes TEXT,
       gdrive_link TEXT,
-      notes ${longTextType}
+      notes ${longTextType},
+      context_file_name TEXT,
+      context_file ${longTextType}
     )
   `,
     `
@@ -379,6 +385,44 @@ function ddlStatements(provider: Provider): string[] {
     )
   `,
   ];
+}
+
+/**
+ * Columns added to `content_items` after a database may already have been
+ * created.
+ *
+ * CREATE TABLE IF NOT EXISTS does nothing to a table that already exists, so
+ * without this an older database would be missing the column and every INSERT —
+ * which lists every column in ITEM_COLUMNS — would fail outright.
+ *
+ * These run on every init and are expected to fail on the second and every
+ * later start. SQLite and MySQL both reject `ADD COLUMN IF NOT EXISTS`, so
+ * "attempt it and ignore the error" is the only form all three engines accept;
+ * Postgres gets the guarded form because it has one and it keeps the server log
+ * quiet. Adding a nullable column is instant on an empty table and cheap on a
+ * populated one.
+ */
+function addColumnStatements(provider: Provider): string[] {
+  const guard = provider === "postgres" ? "IF NOT EXISTS " : "";
+  return [
+    `ALTER TABLE content_items ADD COLUMN ${guard}context_file_name TEXT`,
+    `ALTER TABLE content_items ADD COLUMN ${guard}context_file ${longText(provider)}`,
+  ];
+}
+
+/** Apply addColumnStatements, swallowing the "already exists" failures. */
+async function applyAddColumns(
+  provider: Provider,
+  exec: (sql: string) => Promise<unknown>
+): Promise<void> {
+  for (const stmt of addColumnStatements(provider)) {
+    try {
+      await exec(stmt);
+    } catch {
+      // The column is already there. Any other cause — a missing table, no
+      // permission — surfaces on the first real query instead.
+    }
+  }
 }
 
 /* ---- Shared connection helpers ---- */
@@ -428,6 +472,7 @@ class SqliteAdapter implements Adapter {
     this.db = new Database(SQLITE_PATH);
     this.db.pragma("journal_mode = WAL");
     for (const stmt of ddlStatements("sqlite")) this.db.exec(stmt);
+    await applyAddColumns("sqlite", async (sql) => this.db.exec(sql));
   }
 
   async run(sql: string, params: any[], select: boolean) {
@@ -478,6 +523,7 @@ class MysqlAdapter implements Adapter {
       connectionLimit: poolMax(),
     });
     for (const stmt of ddlStatements("mysql")) await this.pool.query(stmt);
+    await applyAddColumns("mysql", (sql) => this.pool.query(sql));
   }
 
   async run(sql: string, params: any[], select: boolean) {
@@ -529,6 +575,7 @@ class PostgresAdapter implements Adapter {
       max: poolMax(),
     });
     for (const stmt of ddlStatements("postgres")) await this.pool.query(stmt);
+    await applyAddColumns("postgres", (sql) => this.pool.query(sql));
   }
 
   // Rewrite `?` placeholders to `$1, $2, …`.

@@ -6,6 +6,7 @@ import { generate } from "../../../lib/llm";
 import { BRAINSTORM_SCHEMA, buildBrainstormPrompt } from "../../../lib/prompts";
 import { connectionFromBody } from "../test-shared";
 import { isTestModeEnabled, TEST_MODE_DISABLED } from "../../../lib/testMode";
+import { MAX_CONTEXT_FILE_CHARS } from "../../../lib/fields";
 import { sanitizeDraftItem, str } from "../brainstorm/sanitize";
 
 const MIN_COUNT = 1;
@@ -33,13 +34,25 @@ export async function POST(req: NextRequest) {
 
     const campaignName = str(body?.campaignName, 300);
     const campaignGoal = str(body?.campaignGoal, 2000);
-    const leadAvatar = str(body?.leadAvatar, 4000);
-    if (!campaignName || !campaignGoal || !leadAvatar) {
+    if (!campaignName || !campaignGoal) {
       return NextResponse.json(
-        { error: "Campaign name, goal, and lead avatar are all required." },
+        { error: "Campaign name and goal are both required." },
         { status: 400 }
       );
     }
+
+    const contextFile = str(body?.contextFile, MAX_CONTEXT_FILE_CHARS + 1);
+    if (contextFile.length > MAX_CONTEXT_FILE_CHARS) {
+      return NextResponse.json(
+        {
+          error: `That context file is too long. Keep it under ${MAX_CONTEXT_FILE_CHARS.toLocaleString()} characters.`,
+        },
+        { status: 400 }
+      );
+    }
+    const context = contextFile
+      ? { name: str(body?.contextFileName, 300), content: contextFile }
+      : null;
 
     const requested = Number(body?.count);
     const count = Math.min(
@@ -56,9 +69,8 @@ export async function POST(req: NextRequest) {
     const built = buildBrainstormPrompt({
       campaignName,
       campaignGoal,
-      leadAvatar,
-      painPoints: str(body?.painPoints, 4000),
-      desires: str(body?.desires, 4000),
+      contextFile: context?.content ?? "",
+      contextFileName: context?.name,
       count,
       defaults,
     });
@@ -76,7 +88,7 @@ export async function POST(req: NextRequest) {
     const proposed = Array.isArray(result.data?.items) ? result.data.items : [];
     const items = proposed
       .slice(0, count)
-      .map((raw: any) => sanitizeDraftItem(raw, defaults))
+      .map((raw: any) => sanitizeDraftItem(raw, defaults, context))
       .filter(Boolean);
 
     if (items.length === 0) {

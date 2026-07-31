@@ -41,7 +41,23 @@ export const ITEM_FIELDS: ItemField[] = [
   { key: "smes", column: "smes", type: "text" },
   { key: "gdriveLink", column: "gdrive_link", type: "text" },
   { key: "notes", column: "notes", type: "text" },
+  // Appended, never inserted mid-list: the CSV header order and the INSERT
+  // column order both come from this array, and a file exported before a new
+  // field existed must still import cleanly.
+  { key: "contextFileName", column: "context_file_name", type: "text" },
+  { key: "contextFile", column: "context_file", type: "text" },
 ];
+
+/**
+ * How much of an uploaded context file is kept.
+ *
+ * The whole file is sent to the model on every outline and draft, so this is a
+ * cost ceiling as much as a storage one — roughly 10k tokens. Files above it
+ * are rejected at the point of upload rather than silently truncated: a brand
+ * voice guide that loses its last third produces drafts that look fine and are
+ * subtly wrong.
+ */
+export const MAX_CONTEXT_FILE_CHARS = 40000;
 
 /** Fields a caller may set — everything except the server-assigned ones. */
 export const EDITABLE_ITEM_FIELDS = ITEM_FIELDS.filter((f) => !f.readOnly);

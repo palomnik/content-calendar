@@ -6,14 +6,30 @@ export function str(value: unknown, max = 2000): string {
   return String(value).trim().slice(0, max);
 }
 
+/** The uploaded campaign context, copied onto every item it produced. */
+export interface ContextFile {
+  name: string;
+  content: string;
+}
+
 /**
  * Turn one model-proposed item into something safe to create.
  *
  * Unknown keys are dropped, every field is clamped, and contentStatus is forced
  * — the model never chooses a workflow state. Returns null when the row has no
  * headline, which is the one column that cannot be null.
+ *
+ * The context file is stored on each item rather than referenced from a shared
+ * row. It costs some duplication, and buys three things this app depends on:
+ * the item survives a CSV round trip intact, test mode needs no server storage
+ * at all, and an outline generated a year later still uses the brand voice the
+ * idea was conceived under, even if the file has since been replaced.
  */
-export function sanitizeDraftItem(raw: any, defaults: Record<string, string>) {
+export function sanitizeDraftItem(
+  raw: any,
+  defaults: Record<string, string>,
+  context?: ContextFile | null
+) {
   const headline = str(raw?.headline, 300);
   if (!headline) return null;
 
@@ -40,5 +56,7 @@ export function sanitizeDraftItem(raw: any, defaults: Record<string, string>) {
     smes: "",
     gdriveLink: "",
     notes: str(raw?.notes, 4000),
+    contextFileName: context?.name || "",
+    contextFile: context?.content || "",
   };
 }

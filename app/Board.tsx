@@ -2,6 +2,7 @@
 
 import { useEffect, useState, useCallback, useRef } from "react";
 import Link from "next/link";
+import { MAX_CONTEXT_FILE_CHARS } from "./lib/fields";
 import { exportCsv, parseCsv, browserDownload } from "./lib/sqlite";
 import { buildIcs, countIcsEvents } from "./lib/ics";
 import { clearTestSession, liveStore, testStore } from "./lib/store";
@@ -27,6 +28,8 @@ interface ContentItem {
   smes: string | null;
   gdriveLink: string | null;
   notes: string | null;
+  contextFileName: string | null;
+  contextFile: string | null;
 }
 
 /* ─────────────── Design Tokens ─────────────── */
@@ -68,9 +71,8 @@ const AI_ACTIONS: Record<string, { task: "outline" | "draft"; label: string }> =
 const EMPTY_CAMPAIGN = {
   campaignName: "",
   campaignGoal: "",
-  leadAvatar: "",
-  painPoints: "",
-  desires: "",
+  contextFileName: "",
+  contextFile: "",
   count: "6",
   format: "",
   platform: "",
@@ -79,6 +81,101 @@ const EMPTY_CAMPAIGN = {
   dueDate: "",
   publishDate: "",
 };
+
+export interface ContextFileValue {
+  contextFileName: string;
+  contextFile: string;
+}
+
+/**
+ * Upload a markdown file of standing campaign context.
+ *
+ * The file is read in the browser and travels as ordinary JSON — there is no
+ * upload endpoint and nothing is written to disk. It is stored on each content
+ * item, which is what makes it available to the outline and draft generators
+ * long after the campaign that produced the item.
+ */
+function ContextFileField({
+  label,
+  help,
+  value,
+  onChange,
+}: {
+  label: string;
+  help?: string;
+  value: ContextFileValue;
+  onChange: (next: ContextFileValue) => void;
+}) {
+  const [error, setError] = useState<string | null>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  const attached = Boolean(value.contextFile.trim());
+
+  const takeFile = async (file: File | undefined) => {
+    setError(null);
+    // Always clear the picker: without this, choosing the same file again
+    // after a Remove fires no change event and nothing appears to happen.
+    if (inputRef.current) inputRef.current.value = "";
+    if (!file) return;
+    try {
+      const text = await file.text();
+      if (!text.trim()) {
+        setError("That file is empty.");
+        return;
+      }
+      if (text.length > MAX_CONTEXT_FILE_CHARS) {
+        setError(
+          `That file is ${text.length.toLocaleString()} characters. Keep it under ${MAX_CONTEXT_FILE_CHARS.toLocaleString()} — the whole file is sent to the model with every outline and draft.`
+        );
+        return;
+      }
+      onChange({ contextFileName: file.name, contextFile: text });
+    } catch {
+      setError("That file could not be read.");
+    }
+  };
+
+  return (
+    <div>
+      <label className="mb-1.5 block text-xs font-medium uppercase tracking-wide text-[var(--muted)]">
+        {label}
+      </label>
+      {help && (
+        <p className="mb-2 text-xs leading-relaxed text-[var(--muted)]">{help}</p>
+      )}
+      <input
+        ref={inputRef}
+        type="file"
+        accept=".md,.markdown,.mdown,.txt,text/markdown,text/plain"
+        onChange={(e) => void takeFile(e.target.files?.[0])}
+        className="block w-full cursor-pointer text-sm text-[var(--muted)] file:mr-3 file:cursor-pointer file:rounded-md file:border file:border-[var(--border)] file:bg-[var(--surface)] file:px-3 file:py-2 file:text-sm file:font-medium file:text-[var(--foreground)] hover:file:bg-[var(--surface-hover)]"
+      />
+      {attached && (
+        <p className="mt-2 flex flex-wrap items-center gap-2 text-xs text-[var(--muted)]">
+          <span className="font-medium text-[var(--foreground)]">
+            {value.contextFileName || "Context file"}
+          </span>
+          <span>{value.contextFile.length.toLocaleString()} characters</span>
+          <button
+            type="button"
+            onClick={() => {
+              setError(null);
+              onChange({ contextFileName: "", contextFile: "" });
+            }}
+            className="underline transition hover:text-[var(--danger)]"
+          >
+            Remove
+          </button>
+        </p>
+      )}
+      {error && (
+        <p role="alert" className="mt-2 text-xs text-red-600 dark:text-red-400">
+          {error}
+        </p>
+      )}
+    </div>
+  );
+}
 
 /** Append generated text under a dated heading, never overwriting existing notes. */
 function composeNotes(
@@ -111,6 +208,8 @@ const EMPTY_FORM = {
   smes: "",
   gdriveLink: "",
   notes: "",
+  contextFileName: "",
+  contextFile: "",
 };
 
 function toFormValues(item: ContentItem | null) {
@@ -133,6 +232,8 @@ function toFormValues(item: ContentItem | null) {
     smes: item.smes || "",
     gdriveLink: item.gdriveLink || "",
     notes: item.notes || "",
+    contextFileName: item.contextFileName || "",
+    contextFile: item.contextFile || "",
   };
 }
 
@@ -588,9 +689,8 @@ export default function Board({ testMode = false }: { testMode?: boolean }) {
       const { items: proposed } = await store.brainstorm({
         campaignName: campaign.campaignName,
         campaignGoal: campaign.campaignGoal,
-        leadAvatar: campaign.leadAvatar,
-        painPoints: campaign.painPoints,
-        desires: campaign.desires,
+        contextFileName: campaign.contextFileName,
+        contextFile: campaign.contextFile,
         count: Number(campaign.count) || 6,
         defaults: {
           format: campaign.format,
@@ -1489,43 +1589,12 @@ export default function Board({ testMode = false }: { testMode?: boolean }) {
                     }
                   />
                 </div>
-                <div>
-                  <label className={labelClass}>Lead avatar *</label>
-                  <textarea
-                    required
-                    rows={2}
-                    className={inputClass}
-                    placeholder="Backend engineers at 50-200 person SaaS companies"
-                    value={campaign.leadAvatar}
-                    onChange={(e) =>
-                      setCampaign((c) => ({ ...c, leadAvatar: e.target.value }))
-                    }
-                  />
-                </div>
-                <div>
-                  <label className={labelClass}>Pain points</label>
-                  <textarea
-                    rows={2}
-                    className={inputClass}
-                    placeholder="Deploys break at 3am; nobody owns rollback"
-                    value={campaign.painPoints}
-                    onChange={(e) =>
-                      setCampaign((c) => ({ ...c, painPoints: e.target.value }))
-                    }
-                  />
-                </div>
-                <div>
-                  <label className={labelClass}>Desires</label>
-                  <textarea
-                    rows={2}
-                    className={inputClass}
-                    placeholder="Ship on Friday without fear"
-                    value={campaign.desires}
-                    onChange={(e) =>
-                      setCampaign((c) => ({ ...c, desires: e.target.value }))
-                    }
-                  />
-                </div>
+                <ContextFileField
+                  label="Context File Upload"
+                  help="Upload a markdown file with descriptions of your Brand Voice, Product or Service Details, and Ideal Client Avatar. It is saved with every idea you keep, and reused when you generate an outline or a draft."
+                  value={campaign}
+                  onChange={(next) => setCampaign((c) => ({ ...c, ...next }))}
+                />
 
                 <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
                   <div>
@@ -1846,6 +1915,12 @@ export default function Board({ testMode = false }: { testMode?: boolean }) {
                   onChange={(e) => setAddForm((f) => ({ ...f, gdriveLink: e.target.value }))}
                 />
               </div>
+              <ContextFileField
+                label="Context File"
+                help="Optional markdown file — Brand Voice, Product or Service Details, Ideal Client Avatar. The AI outline and draft for this item will follow it."
+                value={addForm}
+                onChange={(next) => setAddForm((f) => ({ ...f, ...next }))}
+              />
               <div className="flex justify-end gap-3 pt-2">
                 <button
                   type="button"
@@ -1977,6 +2052,12 @@ export default function Board({ testMode = false }: { testMode?: boolean }) {
                 <label className={labelClass}>GDrive Link</label>
                 <input className={inputClass} value={editForm.gdriveLink} onChange={(e) => setEditForm((f) => ({ ...f, gdriveLink: e.target.value }))} />
               </div>
+              <ContextFileField
+                label="Context File"
+                help="Markdown file — Brand Voice, Product or Service Details, Ideal Client Avatar. The AI outline and draft for this item will follow it."
+                value={editForm}
+                onChange={(next) => setEditForm((f) => ({ ...f, ...next }))}
+              />
               <div className="flex flex-col-reverse justify-between gap-3 pt-2 sm:flex-row">
                 <button
                   type="button"

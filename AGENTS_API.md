@@ -69,6 +69,8 @@ curl -s -X DELETE http://localhost:3001/api/items/ITEM_ID_HERE
 | `smes` | string | Subject matter experts |
 | `gdriveLink` | string | Google Drive URL |
 | `notes` | string | Free-form notes |
+| `contextFileName` | string | Name of the uploaded context file, e.g. `brand-voice.md` |
+| `contextFile` | string | Markdown context — brand voice, product details, ideal client avatar. Sent to the model with every outline and draft for this item. Max 40,000 characters |
 
 ## For AI Agents
 
