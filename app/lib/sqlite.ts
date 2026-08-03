@@ -103,15 +103,87 @@ export async function brainstormItems(body: any): Promise<{ items: any[] }> {
   });
 }
 
-export async function getAllItems(): Promise<any[]> {
-  return api<any[]>("/items");
+/* ─────────────── Teams ─────────────── */
+
+export interface Team {
+  id: string;
+  name: string;
+  createdAt: string | null;
+  updatedAt: string | null;
+  /** Admin listing only. */
+  memberIds?: string[];
+  itemCount?: number;
 }
 
-export async function createItem(data: any): Promise<any> {
+/** The teams this user belongs to — the boards they can open. */
+export async function getMyTeams(): Promise<Team[]> {
+  const { teams } = await api<{ teams: Team[] }>("/teams");
+  return teams;
+}
+
+/** Every team, with membership and item counts. Admin only, server-enforced. */
+export async function getAllTeams(): Promise<Team[]> {
+  const { teams } = await api<{ teams: Team[] }>("/teams?all=1");
+  return teams;
+}
+
+export async function createTeam(name: string, memberIds: string[]): Promise<Team> {
+  return api<Team>("/teams", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name, memberIds }),
+  });
+}
+
+export async function updateTeam(
+  id: string,
+  patch: { name?: string; memberIds?: string[] }
+): Promise<Team> {
+  return api<Team>(`/teams/${id}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(patch),
+  });
+}
+
+/**
+ * Delete a team.
+ *
+ * Without `deleteItems` the server refuses a team that still holds items and
+ * answers 409 with the count, which is what the confirmation prompt is built
+ * from — the caller asks, then repeats the call having been told the cost.
+ */
+export async function deleteTeam(
+  id: string,
+  deleteItems = false
+): Promise<{ deletedItems: number }> {
+  const res = await fetch(
+    `${API_BASE}/teams/${id}${deleteItems ? "?deleteItems=true" : ""}`,
+    { method: "DELETE" }
+  );
+  const body = await res.json().catch(() => ({ error: res.statusText }));
+  if (!res.ok) {
+    const err: any = new Error(body.error || `${res.status} ${res.statusText}`);
+    err.status = res.status;
+    err.itemCount = body.itemCount;
+    throw err;
+  }
+  return body;
+}
+
+/* ─────────────── Items ─────────────── */
+
+export async function getAllItems(teamId: string | null): Promise<any[]> {
+  return api<any[]>(teamId ? `/items?teamId=${encodeURIComponent(teamId)}` : "/items");
+}
+
+export async function createItem(data: any, teamId: string | null): Promise<any> {
   return api<any>("/items", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(data),
+    // The server takes this as a request, not an instruction: it creates the
+    // item only if the session actually belongs to that team.
+    body: JSON.stringify({ ...data, teamId }),
   });
 }
 

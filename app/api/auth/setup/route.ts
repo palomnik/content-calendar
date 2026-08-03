@@ -8,7 +8,7 @@ import {
   setupTokenValid,
   usernameProblem,
 } from "../../../lib/auth";
-import { insertUser } from "../../../lib/db";
+import { insertUser, listTeams } from "../../../lib/db";
 import { checkRateLimit, clientKey, recordFailure } from "../../../lib/ratelimit";
 
 // POST /api/auth/setup — claim the first administrator account.
@@ -51,11 +51,17 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: "Passwords do not match." }, { status: 400 });
     }
 
+    // The first admin joins every team that exists, which on a fresh install is
+    // the single "General" team created with the schema. Without this they
+    // would sign in to a board they are not a member of and see nothing.
+    const teams = await listTeams();
+
     const user = await insertUser({
       username: body.username,
       passwordHash: hashPassword(body.password),
       role: "admin",
       displayName: typeof body.displayName === "string" ? body.displayName.trim() || null : null,
+      teamIds: teams.map((team) => team.id),
     });
 
     // Sign the new admin straight in.

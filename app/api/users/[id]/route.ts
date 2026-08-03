@@ -6,6 +6,8 @@ import {
   deleteUser,
   findUserById,
   Role,
+  setUserTeams,
+  teamIdsByUser,
   updateUser,
 } from "../../../lib/db";
 
@@ -48,13 +50,26 @@ export async function PATCH(
         typeof body.displayName === "string" ? body.displayName.trim() || null : null;
     }
 
+    // Replaces the whole list: a team left out is a team left. Nothing stops an
+    // admin removing their own last team — they can add it back from the same
+    // screen, and locking the check would be more confusing than the mistake.
+    if (Array.isArray(body?.teamIds)) {
+      await setUserTeams(
+        id,
+        body.teamIds.filter((teamId: unknown) => typeof teamId === "string")
+      );
+    }
+
     const updated = await updateUser(id, patch);
     if (!updated) return NextResponse.json({ error: "Not found" }, { status: 404 });
 
     // An admin-forced password reset kicks that user off every device.
     if (patch.passwordHash) await deleteSessionsForUser(id);
 
-    return NextResponse.json(updated);
+    return NextResponse.json({
+      ...updated,
+      teamIds: (await teamIdsByUser())[id] ?? [],
+    });
   } catch (e: any) {
     return NextResponse.json({ error: e.message }, { status: 400 });
   }

@@ -3,7 +3,7 @@
 import { useEffect, useState, useCallback, useRef } from "react";
 import Link from "next/link";
 import { MAX_CONTEXT_FILE_CHARS } from "./lib/fields";
-import { exportCsv, parseCsv, browserDownload } from "./lib/sqlite";
+import { exportCsv, parseCsv, browserDownload, getMyTeams, Team } from "./lib/sqlite";
 import { buildIcs, countIcsEvents } from "./lib/ics";
 import { clearTestSession, liveStore, testStore } from "./lib/store";
 import { leaveTo, signOut, useAuth } from "./lib/useAuth";
@@ -189,6 +189,9 @@ function composeNotes(
   const prior = String(existing ?? "").trim();
   return prior ? `${prior}\n\n---\n\n${block}` : block;
 }
+
+/** Remembers which board was open, per browser. Never trusted for access. */
+const LAST_TEAM_KEY = "cc_last_team";
 
 const EMPTY_FORM = {
   headline: "",
@@ -471,6 +474,13 @@ export default function Board({ testMode = false }: { testMode?: boolean }) {
   const [items, setItems] = useState<ContentItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+
+  /* ── Teams ── */
+  // One board per team. `teams` stays null in test mode, which has no account
+  // and therefore no teams — the switcher and everything around it is hidden
+  // rather than faked.
+  const [teams, setTeams] = useState<Team[] | null>(null);
+  const [teamId, setTeamId] = useState<string | null>(null);
   const { toasts, show, dismiss } = useToast();
 
   const boardRef = useRef<HTMLElement | null>(null);
@@ -514,14 +524,58 @@ export default function Board({ testMode = false }: { testMode?: boolean }) {
   const [chosen, setChosen] = useState<Set<number>>(new Set());
   const [creatingItems, setCreatingItems] = useState(false);
 
+  // Which board was open last time. A preference only — the server decides
+  // whether this session may actually read that team, and a stale id here is
+  // dropped below rather than trusted.
   useEffect(() => {
+    if (testMode) return;
+    let cancelled = false;
+
+    getMyTeams()
+      .then((mine) => {
+        if (cancelled) return;
+        setTeams(mine);
+        const remembered = window.localStorage.getItem(LAST_TEAM_KEY);
+        const keep = mine.some((t) => t.id === remembered) ? remembered : null;
+        setTeamId(keep ?? mine[0]?.id ?? null);
+      })
+      .catch((e) => {
+        if (cancelled) return;
+        console.error("Failed to load teams:", e);
+        setError("Could not load your teams: " + String(e));
+        setLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [testMode]);
+
+  useEffect(() => {
+    // Live mode waits for the team list: loading a board before knowing which
+    // board would just be the server's fallback choice, then a second load.
+    if (!testMode) {
+      if (teams === null) return;
+      if (teams.length === 0) {
+        setItems([]);
+        setLoading(false);
+        return;
+      }
+      if (!teamId) return;
+    }
+
+    let cancelled = false;
+    setLoading(true);
+
     store
-      .getAll()
+      .getAll(teamId)
       .then((data) => {
+        if (cancelled) return;
         setItems(data);
         setLoading(false);
       })
       .catch((e) => {
+        if (cancelled) return;
         console.error("Failed to load items:", e);
         setError(
           (testMode ? "Could not start test mode: " : "Database failed to load: ") +
@@ -529,7 +583,22 @@ export default function Board({ testMode = false }: { testMode?: boolean }) {
         );
         setLoading(false);
       });
-  }, [store, testMode]);
+
+    return () => {
+      cancelled = true;
+    };
+  }, [store, testMode, teams, teamId]);
+
+  const switchTeam = (next: string) => {
+    setTeamId(next);
+    setSearch("");
+    try {
+      window.localStorage.setItem(LAST_TEAM_KEY, next);
+    } catch {
+      // Private mode, or storage disabled. The board still switches; it just
+      // will not remember the choice on the next visit.
+    }
+  };
 
   // Hide the AI buttons entirely when nothing is configured — a button that
   // always errors is worse than no button.
@@ -539,7 +608,7 @@ export default function Board({ testMode = false }: { testMode?: boolean }) {
 
   const refresh = async () => {
     try {
-      const data = await store.getAll();
+      const data = await store.getAll(teamId);
       setItems(data);
     } catch (e: any) {
       setError(String(e));
@@ -552,12 +621,15 @@ export default function Board({ testMode = false }: { testMode?: boolean }) {
     if (!addForm.headline.trim()) return;
     setAddSaving(true);
     try {
-      const newItem = await store.create({
-        ...addForm,
-        wordCount: addForm.wordCount ? parseInt(addForm.wordCount, 10) : null,
-        dueDate: addForm.dueDate || null,
-        publishDate: addForm.publishDate || null,
-      });
+      const newItem = await store.create(
+        {
+          ...addForm,
+          wordCount: addForm.wordCount ? parseInt(addForm.wordCount, 10) : null,
+          dueDate: addForm.dueDate || null,
+          publishDate: addForm.publishDate || null,
+        },
+        teamId
+      );
       setItems((prev) => [newItem, ...prev]);
       setAddForm(EMPTY_FORM);
       setShowAddModal(false);
@@ -718,7 +790,7 @@ export default function Board({ testMode = false }: { testMode?: boolean }) {
       const created: ContentItem[] = [];
       for (let i = 0; i < proposals.length; i++) {
         if (!chosen.has(i)) continue;
-        created.push(await store.create(proposals[i]));
+        created.push(await store.create(proposals[i], teamId));
       }
       setItems((prev) => [...created, ...prev]);
       show(`Created ${created.length} item${created.length === 1 ? "" : "s"}`, "success");
@@ -956,8 +1028,11 @@ export default function Board({ testMode = false }: { testMode?: boolean }) {
   const handleImportCsv = async (csvText: string) => {
     try {
       const rows = parseCsv(csvText);
+      // An import lands on the board that is open. The CSV has no team column
+      // and never will: a spreadsheet is not the place to decide who can read
+      // what.
       for (const row of rows) {
-        await store.create(row);
+        await store.create(row, teamId);
       }
       refresh();
       show(`Imported ${rows.length} items`, "success");
@@ -1086,6 +1161,40 @@ export default function Board({ testMode = false }: { testMode?: boolean }) {
     );
   }
 
+  /* ─────────────── No team ─────────────── */
+  // Content lives on team boards, so an account on no team has nothing to show.
+  // This is a normal state during onboarding, not an error — hence a route out
+  // (settings, where an admin can fix it themselves) rather than a dead end.
+  if (!testMode && teams && teams.length === 0) {
+    return (
+      <div className="app-shell flex flex-col items-center justify-center overflow-hidden bg-[var(--background)] px-6">
+        <div className="mb-4 text-5xl">🗂️</div>
+        <h1 className="mb-2 text-lg font-semibold text-[var(--foreground)]">
+          No team board yet
+        </h1>
+        <p className="mb-6 max-w-md text-center text-sm text-[var(--muted)]">
+          {user?.role === "admin"
+            ? "Create a team in Settings and add yourself to it. Each team gets its own board, visible only to its members."
+            : "You are not a member of any team. An administrator can add you to one — each team has its own board, and you will see it here."}
+        </p>
+        <div className="flex items-center gap-3">
+          <Link
+            href="/settings"
+            className="rounded-lg bg-[var(--accent)] px-4 py-2 text-sm font-medium text-white transition hover:bg-[var(--accent-hover)]"
+          >
+            {user?.role === "admin" ? "Set up teams" : "Settings"}
+          </Link>
+          <button
+            onClick={() => signOut()}
+            className="rounded-lg border border-[var(--border)] px-4 py-2 text-sm font-medium text-[var(--foreground)] transition hover:bg-[var(--surface)]"
+          >
+            Sign out
+          </button>
+        </div>
+      </div>
+    );
+  }
+
   /* ─────────────── Main UI ─────────────── */
   return (
     <div className={`app-shell flex flex-col overflow-hidden bg-[var(--background)] ${
@@ -1104,6 +1213,29 @@ export default function Board({ testMode = false }: { testMode?: boolean }) {
           <h1 className="text-base font-semibold tracking-tight text-[var(--foreground)] md:text-lg">
             Content Calendar
           </h1>
+          {/* One board per team. A dropdown only when there is a choice to
+              make — a select with a single option is a control that does
+              nothing, so a member of one team just sees its name. */}
+          {teams && teams.length > 1 && (
+            <select
+              value={teamId ?? ""}
+              onChange={(e) => switchTeam(e.target.value)}
+              aria-label="Team board"
+              title="Switch team board"
+              className="max-w-[9rem] rounded-lg border border-[var(--border)] bg-[var(--surface)] px-2 py-1 text-sm font-medium text-[var(--foreground)] transition hover:bg-[var(--surface-hover)] focus:border-[var(--accent)] focus:outline-none focus:ring-1 focus:ring-[var(--accent)] md:max-w-none"
+            >
+              {teams.map((team) => (
+                <option key={team.id} value={team.id}>
+                  {team.name}
+                </option>
+              ))}
+            </select>
+          )}
+          {teams && teams.length === 1 && (
+            <span className="hidden rounded-full bg-[var(--surface)] px-2.5 py-0.5 text-xs font-medium text-[var(--foreground)] sm:inline-block">
+              {teams[0].name}
+            </span>
+          )}
           <span className="hidden rounded-full bg-[var(--surface)] px-2 py-0.5 text-xs font-medium text-[var(--muted)] md:inline-block">
             {items.length}
           </span>

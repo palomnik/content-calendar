@@ -12,18 +12,42 @@ When hosting on an external domain via Caddy, replace accordingly:
 https://contentcalendar.example.com/api/items
 ```
 
+## Authentication and teams
+
+Every endpoint below requires a signed-in session cookie. Sign in once and keep
+the cookie jar:
+
+```bash
+curl -s -c cc.jar -X POST http://localhost:3001/api/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"jsmith","password":"…"}'
+```
+
+Content lives on **team boards**. An account sees only the boards of the teams it
+belongs to, so every call is scoped to a team — including for administrators,
+who get no access to a team they are not a member of.
+
+```bash
+# Teams this account can reach
+curl -s -b cc.jar http://localhost:3001/api/teams
+```
+
+Where a team is not named explicitly the account's first team is used, so a
+single-team account can leave `teamId` out entirely.
+
 ## Endpoints
 
-### List all items
+### List a team's items
 ```bash
-curl -s http://localhost:3001/api/items | python3 -m json.tool
+curl -s -b cc.jar "http://localhost:3001/api/items?teamId=TEAM_ID" | python3 -m json.tool
 ```
 
 ### Create a new item
 ```bash
-curl -s -X POST http://localhost:3001/api/items \
+curl -s -b cc.jar -X POST http://localhost:3001/api/items \
   -H "Content-Type: application/json" \
   -d '{
+    "teamId": "TEAM_ID",
     "headline": "How to Build a Content Calendar",
     "description": "Step-by-step guide for planning editorial content",
     "format": "Blog Post",
@@ -35,7 +59,7 @@ curl -s -X POST http://localhost:3001/api/items \
 
 ### Update an item (e.g., move to Draft)
 ```bash
-curl -s -X PATCH http://localhost:3001/api/items/ITEM_ID_HERE \
+curl -s -b cc.jar -X PATCH http://localhost:3001/api/items/ITEM_ID_HERE \
   -H "Content-Type: application/json" \
   -d '{
     "contentStatus": "Draft",
@@ -43,9 +67,13 @@ curl -s -X PATCH http://localhost:3001/api/items/ITEM_ID_HERE \
   }'
 ```
 
+An item cannot be moved between teams. `teamId` in a PATCH body is ignored — a
+board is a permission boundary, and a stray field in an update is not the way
+content should cross one.
+
 ### Delete an item
 ```bash
-curl -s -X DELETE http://localhost:3001/api/items/ITEM_ID_HERE
+curl -s -b cc.jar -X DELETE http://localhost:3001/api/items/ITEM_ID_HERE
 ```
 
 ## Full Field Reference
@@ -77,7 +105,11 @@ curl -s -X DELETE http://localhost:3001/api/items/ITEM_ID_HERE
 When you (or another agent) want to modify the content calendar, use these curl commands or equivalent HTTP requests. The API returns JSON and uses standard HTTP status codes:
 - `200` — success (GET, PATCH, DELETE)
 - `201` — created (POST)
-- `404` — item not found
+- `401` — not signed in, or the session has expired
+- `403` — the named team is not one this account belongs to
+- `404` — item not found. Also returned for an item on another team's board:
+  a `403` there would confirm the id is real, which would leak what other teams
+  are working on
 - `500` — server error
 
 ## Important Notes

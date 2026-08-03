@@ -179,8 +179,346 @@ function AccountSection({ user }: { user: SessionUser }) {
 
 /* ─────────────── User management (admin) ─────────────── */
 
-function UsersSection({ currentUser }: { currentUser: SessionUser }) {
-  const [users, setUsers] = useState<SessionUser[] | null>(null);
+/**
+ * Accounts and teams, loaded together.
+ *
+ * The two sections below edit opposite ends of the same relationship — a team's
+ * member list and an account's team list — so they share one copy of both. Two
+ * independent fetches would let one section keep showing a membership the other
+ * had just changed.
+ */
+interface DirectoryUser extends SessionUser {
+  teamIds: string[];
+}
+
+interface TeamSummary {
+  id: string;
+  name: string;
+  memberIds: string[];
+  itemCount: number;
+}
+
+interface Directory {
+  users: DirectoryUser[] | null;
+  teams: TeamSummary[] | null;
+  reload: () => Promise<void>;
+  error: string | null;
+}
+
+function useDirectory(enabled: boolean): Directory {
+  const [users, setUsers] = useState<DirectoryUser[] | null>(null);
+  const [teams, setTeams] = useState<TeamSummary[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const reload = useCallback(async () => {
+    try {
+      const [userRes, teamRes] = await Promise.all([
+        fetch("/api/users"),
+        fetch("/api/teams?all=1"),
+      ]);
+      const userData = await userRes.json();
+      const teamData = await teamRes.json();
+      if (!userRes.ok) throw new Error(userData.error || "Failed to load users");
+      if (!teamRes.ok) throw new Error(teamData.error || "Failed to load teams");
+      setUsers(userData);
+      setTeams(teamData.teams);
+      setError(null);
+    } catch (e: any) {
+      setError(e.message);
+      setUsers((prev) => prev ?? []);
+      setTeams((prev) => prev ?? []);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (enabled) reload();
+  }, [enabled, reload]);
+
+  return { users, teams, reload, error };
+}
+
+/** Tick-box list of accounts, used for "who is on this team". */
+function MemberPicker({
+  users,
+  selected,
+  onChange,
+  emptyHint,
+}: {
+  users: DirectoryUser[];
+  selected: string[];
+  onChange: (ids: string[]) => void;
+  emptyHint: string;
+}) {
+  if (users.length === 0) {
+    return <p className="text-xs text-[var(--muted)]">{emptyHint}</p>;
+  }
+  const toggle = (id: string) =>
+    onChange(
+      selected.includes(id) ? selected.filter((s) => s !== id) : [...selected, id]
+    );
+
+  return (
+    <div className="flex flex-wrap gap-x-4 gap-y-2">
+      {users.map((u) => (
+        <label
+          key={u.id}
+          className="flex cursor-pointer items-center gap-2 text-sm text-[var(--foreground)]"
+        >
+          <input
+            type="checkbox"
+            checked={selected.includes(u.id)}
+            onChange={() => toggle(u.id)}
+          />
+          <span className="truncate">{u.displayName || u.username}</span>
+        </label>
+      ))}
+    </div>
+  );
+}
+
+/* ─────────────── Teams (admin) ─────────────── */
+
+function TeamsSection({
+  currentUser,
+  directory,
+}: {
+  currentUser: SessionUser;
+  directory: Directory;
+}) {
+  const { users, teams, reload } = directory;
+  const [message, setMessage] = useState<Message>(null);
+  const [busy, setBusy] = useState<string | null>(null);
+
+  // Per-team edits, held locally until saved. Re-seeded whenever the server
+  // copy changes, which is exactly when unsaved edits stop being meaningful.
+  const [drafts, setDrafts] = useState<Record<string, { name: string; memberIds: string[] }>>({});
+  useEffect(() => {
+    if (!teams) return;
+    setDrafts(
+      Object.fromEntries(
+        teams.map((t) => [t.id, { name: t.name, memberIds: [...t.memberIds] }])
+      )
+    );
+  }, [teams]);
+
+  const [newTeam, setNewTeam] = useState<{ name: string; memberIds: string[] }>({
+    name: "",
+    // Whoever is creating the team is on it by default: an admin almost always
+    // wants to see the board they just made, and unticking is one click.
+    memberIds: [currentUser.id],
+  });
+
+  const save = async (team: TeamSummary) => {
+    const draft = drafts[team.id];
+    if (!draft) return;
+    setBusy(team.id);
+    setMessage(null);
+    try {
+      await postJson(
+        `/api/teams/${team.id}`,
+        { name: draft.name, memberIds: draft.memberIds },
+        "PATCH"
+      );
+      setMessage({ type: "success", text: `Saved “${draft.name.trim()}”.` });
+      await reload();
+    } catch (e: any) {
+      setMessage({ type: "error", text: e.message });
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const remove = async (team: TeamSummary) => {
+    setMessage(null);
+    // Asked without the flag first, so the confirmation can quote the real
+    // number of items at risk rather than a number this page cached earlier.
+    const attempt = async (deleteItems: boolean) => {
+      const res = await fetch(
+        `/api/teams/${team.id}${deleteItems ? "?deleteItems=true" : ""}`,
+        { method: "DELETE" }
+      );
+      const data = await res.json().catch(() => ({}));
+      return { ok: res.ok, status: res.status, data };
+    };
+
+    if (!window.confirm(`Delete the team “${team.name}”?`)) return;
+
+    setBusy(team.id);
+    try {
+      let result = await attempt(false);
+
+      if (!result.ok && result.status === 409) {
+        const count = result.data.itemCount ?? 0;
+        const confirmed = window.confirm(
+          `“${team.name}” has ${count} content item${count === 1 ? "" : "s"}. ` +
+            `Deleting the team deletes them permanently. Continue?`
+        );
+        if (!confirmed) {
+          setBusy(null);
+          return;
+        }
+        result = await attempt(true);
+      }
+
+      if (!result.ok) throw new Error(result.data.error || "Failed to delete team");
+      setMessage({ type: "success", text: `Deleted “${team.name}”.` });
+      await reload();
+    } catch (e: any) {
+      setMessage({ type: "error", text: e.message });
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const create = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setBusy("new");
+    setMessage(null);
+    try {
+      await postJson("/api/teams", newTeam);
+      setMessage({ type: "success", text: `Created team “${newTeam.name.trim()}”.` });
+      setNewTeam({ name: "", memberIds: [currentUser.id] });
+      await reload();
+    } catch (e: any) {
+      setMessage({ type: "error", text: e.message });
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const dirty = (team: TeamSummary) => {
+    const draft = drafts[team.id];
+    if (!draft) return false;
+    return (
+      draft.name !== team.name ||
+      draft.memberIds.length !== team.memberIds.length ||
+      draft.memberIds.some((id) => !team.memberIds.includes(id))
+    );
+  };
+
+  return (
+    <Section
+      title="Teams"
+      description="Each team has its own board. Members see only the boards of the teams they belong to — someone on two teams sees both, and no one else's. Administrators are no exception: add yourself to a team to see its board."
+    >
+      <div className="space-y-6">
+        <div className="overflow-hidden rounded-xl border border-[var(--border)]">
+          {teams === null || users === null ? (
+            <div className="skeleton h-32 w-full" />
+          ) : teams.length === 0 ? (
+            <p className="px-4 py-6 text-sm text-[var(--muted)]">
+              No teams yet. Create one below — until then, no one has a board.
+            </p>
+          ) : (
+            <ul className="divide-y divide-[var(--border)]">
+              {teams.map((team) => {
+                const draft = drafts[team.id] ?? {
+                  name: team.name,
+                  memberIds: team.memberIds,
+                };
+                return (
+                  <li key={team.id} className="space-y-3 px-4 py-4">
+                    <div className="flex flex-wrap items-center gap-3">
+                      <input
+                        className={`${inputClass} max-w-xs flex-1`}
+                        value={draft.name}
+                        aria-label={`Name of team ${team.name}`}
+                        onChange={(e) =>
+                          setDrafts((d) => ({
+                            ...d,
+                            [team.id]: { ...draft, name: e.target.value },
+                          }))
+                        }
+                      />
+                      <span className="text-xs text-[var(--muted)]">
+                        {team.itemCount} item{team.itemCount === 1 ? "" : "s"}
+                      </span>
+                      <div className="ml-auto flex items-center gap-2">
+                        <button
+                          onClick={() => save(team)}
+                          disabled={busy === team.id || !dirty(team)}
+                          className={primaryButton}
+                        >
+                          {busy === team.id ? "Saving…" : "Save"}
+                        </button>
+                        <button
+                          onClick={() => remove(team)}
+                          disabled={busy === team.id}
+                          className="rounded-lg border border-[var(--border)] px-3 py-2 text-sm text-[var(--danger)] transition hover:bg-[var(--surface)] disabled:opacity-40"
+                        >
+                          Delete
+                        </button>
+                      </div>
+                    </div>
+
+                    <div>
+                      <p className={labelClass}>Members</p>
+                      <MemberPicker
+                        users={users}
+                        selected={draft.memberIds}
+                        onChange={(memberIds) =>
+                          setDrafts((d) => ({ ...d, [team.id]: { ...draft, memberIds } }))
+                        }
+                        emptyHint="No accounts exist yet."
+                      />
+                      {draft.memberIds.length === 0 && (
+                        <p className="mt-2 text-xs text-[var(--danger)]">
+                          With no members this board is invisible to everyone, including you.
+                        </p>
+                      )}
+                    </div>
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+        </div>
+
+        <Notice message={message} />
+
+        <form
+          onSubmit={create}
+          className="space-y-4 rounded-xl border border-[var(--border)] bg-[var(--surface)] p-4"
+        >
+          <h3 className="text-sm font-semibold text-[var(--foreground)]">Create team</h3>
+          <div>
+            <label className={labelClass}>Team name</label>
+            <input
+              className={`${inputClass} max-w-sm`}
+              placeholder="Marketing"
+              required
+              value={newTeam.name}
+              onChange={(e) => setNewTeam((t) => ({ ...t, name: e.target.value }))}
+            />
+          </div>
+          <div>
+            <p className={labelClass}>Members</p>
+            <MemberPicker
+              users={users ?? []}
+              selected={newTeam.memberIds}
+              onChange={(memberIds) => setNewTeam((t) => ({ ...t, memberIds }))}
+              emptyHint="No accounts exist yet."
+            />
+          </div>
+          <button type="submit" disabled={busy === "new"} className={primaryButton}>
+            {busy === "new" ? "Creating…" : "Create team"}
+          </button>
+        </form>
+      </div>
+    </Section>
+  );
+}
+
+/* ─────────────── Users (admin) ─────────────── */
+
+function UsersSection({
+  currentUser,
+  directory,
+}: {
+  currentUser: SessionUser;
+  directory: Directory;
+}) {
+  const { users, teams, reload: load } = directory;
   const [message, setMessage] = useState<Message>(null);
   const [busy, setBusy] = useState(false);
 
@@ -189,27 +527,14 @@ function UsersSection({ currentUser }: { currentUser: SessionUser }) {
     displayName: "",
     password: "",
     role: "user" as "user" | "admin",
+    teamIds: [] as string[],
   });
 
   // id of the user whose password is being reset inline
   const [resetting, setResetting] = useState<string | null>(null);
   const [resetPassword, setResetPassword] = useState("");
 
-  const load = useCallback(async () => {
-    try {
-      const res = await fetch("/api/users");
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || "Failed to load users");
-      setUsers(data);
-    } catch (e: any) {
-      setMessage({ type: "error", text: e.message });
-      setUsers([]);
-    }
-  }, []);
-
-  useEffect(() => {
-    load();
-  }, [load]);
+  const teamName = (id: string) => teams?.find((t) => t.id === id)?.name ?? "unknown team";
 
   const create = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -218,7 +543,13 @@ function UsersSection({ currentUser }: { currentUser: SessionUser }) {
     try {
       await postJson("/api/users", form);
       setMessage({ type: "success", text: `Created account “${form.username.trim()}”.` });
-      setForm({ username: "", displayName: "", password: "", role: "user" });
+      setForm({
+        username: "",
+        displayName: "",
+        password: "",
+        role: "user",
+        teamIds: [],
+      });
       await load();
     } catch (e: any) {
       setMessage({ type: "error", text: e.message });
@@ -278,7 +609,7 @@ function UsersSection({ currentUser }: { currentUser: SessionUser }) {
   return (
     <Section
       title="Users"
-      description="Everyone with an account can view and edit all content items. Administrators can additionally manage accounts and database settings."
+      description="An account can view and edit content on the boards of the teams it belongs to, and nothing else. Administrators can additionally manage accounts, teams, and database settings. Change who is on which team in the Teams section above."
     >
       <div className="space-y-6">
         {/* Existing accounts */}
@@ -306,6 +637,24 @@ function UsersSection({ currentUser }: { currentUser: SessionUser }) {
                           )}
                         </div>
                         <p className="truncate text-xs text-[var(--muted)]">{u.username}</p>
+                        {/* Shown, not edited, here: membership is edited from
+                            the team side so there is one place it can change. */}
+                        <div className="mt-1 flex flex-wrap items-center gap-1">
+                          {u.teamIds.length === 0 ? (
+                            <span className="text-xs text-[var(--danger)]">
+                              No team — sees no board
+                            </span>
+                          ) : (
+                            u.teamIds.map((id) => (
+                              <span
+                                key={id}
+                                className="rounded-full bg-[var(--surface)] px-2 py-0.5 text-xs text-[var(--muted)]"
+                              >
+                                {teamName(id)}
+                              </span>
+                            ))
+                          )}
+                        </div>
                       </div>
 
                       <select
@@ -433,6 +782,44 @@ function UsersSection({ currentUser }: { currentUser: SessionUser }) {
             At least 8 characters. Share it with the new user and ask them to change it from
             this page after signing in.
           </p>
+          <div>
+            <p className={labelClass}>Teams</p>
+            {teams === null ? (
+              <div className="skeleton h-5 w-40" />
+            ) : teams.length === 0 ? (
+              <p className="text-xs text-[var(--muted)]">
+                No teams exist yet. Create one above first.
+              </p>
+            ) : (
+              <div className="flex flex-wrap gap-x-4 gap-y-2">
+                {teams.map((team) => (
+                  <label
+                    key={team.id}
+                    className="flex cursor-pointer items-center gap-2 text-sm text-[var(--foreground)]"
+                  >
+                    <input
+                      type="checkbox"
+                      checked={form.teamIds.includes(team.id)}
+                      onChange={() =>
+                        setForm((f) => ({
+                          ...f,
+                          teamIds: f.teamIds.includes(team.id)
+                            ? f.teamIds.filter((id) => id !== team.id)
+                            : [...f.teamIds, team.id],
+                        }))
+                      }
+                    />
+                    <span className="truncate">{team.name}</span>
+                  </label>
+                ))}
+              </div>
+            )}
+            {form.teamIds.length === 0 && (teams?.length ?? 0) > 0 && (
+              <p className="mt-2 text-xs text-[var(--muted)]">
+                Pick at least one, or this account signs in to an empty screen.
+              </p>
+            )}
+          </div>
           <button type="submit" disabled={busy} className={primaryButton}>
             {busy ? "Creating…" : "Create account"}
           </button>
@@ -1277,6 +1664,8 @@ function RestoreSection() {
 
 export default function SettingsPage() {
   const { user, loading } = useAuth();
+  // Only administrators can read either endpoint, so only they load them.
+  const directory = useDirectory(user?.role === "admin");
 
   return (
     <div className="min-h-screen bg-[var(--background)]">
@@ -1301,7 +1690,12 @@ export default function SettingsPage() {
           <>
             <AccountSection user={user} />
             <AiSection user={user} />
-            {user.role === "admin" && <UsersSection currentUser={user} />}
+            {user.role === "admin" && (
+              <TeamsSection currentUser={user} directory={directory} />
+            )}
+            {user.role === "admin" && (
+              <UsersSection currentUser={user} directory={directory} />
+            )}
             {user.role === "admin" && <DatabaseSection />}
             {user.role === "admin" && <BackupSection />}
             {user.role === "admin" && <RestoreSection />}

@@ -236,7 +236,7 @@ export function writeConfig(config: DbConfig): void {
   if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
   writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2), "utf8");
   // Invalidate any cached adapter so the next request reconnects.
-  cachedAdapter = null;
+  adapterPromise = null;
   cachedKey = null;
 }
 
@@ -264,6 +264,9 @@ const FIELD_MAP: Record<string, string> = ITEM_FIELD_MAP;
 export function rowToItem(row: any): any {
   const item: Record<string, any> = {};
   for (const field of ITEM_FIELDS) item[field.key] = row[field.column] ?? null;
+  // Not an ITEM_FIELD — see createItem for why — but the routes need it to
+  // authorize, and the board uses it to notice a stale team selection.
+  item.teamId = row.team_id ?? null;
   return item;
 }
 
@@ -338,7 +341,33 @@ function ddlStatements(provider: Provider): string[] {
       gdrive_link TEXT,
       notes ${longTextType},
       context_file_name TEXT,
-      context_file ${longTextType}
+      context_file ${longTextType},
+      team_id ${idType}
+    )
+  `,
+    // A board. Every content item belongs to exactly one, and only members of
+    // that team can see or touch it.
+    //
+    // No UNIQUE on name, for the same reason llm_connections has no constraints:
+    // there is no migration system here, so a constraint added now could never
+    // be dropped from an already-deployed database. Name collisions are rejected
+    // in insertTeam/updateTeam instead.
+    `
+    CREATE TABLE IF NOT EXISTS teams (
+      id ${idType} PRIMARY KEY,
+      created_at ${shortType},
+      updated_at ${shortType},
+      name ${nameType} NOT NULL
+    )
+  `,
+    // Who is on which board. One row per (user, team); a user on two teams has
+    // two rows and sees both boards.
+    `
+    CREATE TABLE IF NOT EXISTS team_members (
+      id ${idType} PRIMARY KEY,
+      team_id ${idType} NOT NULL,
+      user_id ${idType} NOT NULL,
+      created_at ${shortType}
     )
   `,
     `
@@ -404,9 +433,13 @@ function ddlStatements(provider: Provider): string[] {
  */
 function addColumnStatements(provider: Provider): string[] {
   const guard = provider === "postgres" ? "IF NOT EXISTS " : "";
+  const idType = provider === "sqlite" ? "TEXT" : "VARCHAR(64)";
   return [
     `ALTER TABLE content_items ADD COLUMN ${guard}context_file_name TEXT`,
     `ALTER TABLE content_items ADD COLUMN ${guard}context_file ${longText(provider)}`,
+    // Nullable on purpose. Rows that predate teams arrive here with no team;
+    // backfillTeams() adopts them into the default team on the next start.
+    `ALTER TABLE content_items ADD COLUMN ${guard}team_id ${idType}`,
   ];
 }
 
@@ -631,27 +664,361 @@ function buildAdapter(config: DbConfig): Adapter {
 
 /* ─────────────── Adapter cache ─────────────── */
 
-let cachedAdapter: Adapter | null = null;
+// The in-flight promise is cached, not the adapter, so two requests arriving
+// together on a cold process share one connection pool instead of each building
+// their own. A failed setup clears the cache so the next request retries rather
+// than inheriting a half-built adapter forever.
+let adapterPromise: Promise<Adapter> | null = null;
 let cachedKey: string | null = null;
 
-async function getAdapter(): Promise<Adapter> {
+function getAdapter(): Promise<Adapter> {
   const config = readConfig();
   const key = JSON.stringify(config);
-  if (!cachedAdapter || cachedKey !== key) {
-    cachedAdapter = buildAdapter(config);
+  if (!adapterPromise || cachedKey !== key) {
     cachedKey = key;
-    await cachedAdapter.init();
+    const adapter = buildAdapter(config);
+    adapterPromise = (async () => {
+      await adapter.init();
+      await backfillTeams((sql, params, select) => adapter.run(sql, params, select));
+      return adapter;
+    })().catch((e) => {
+      adapterPromise = null;
+      cachedKey = null;
+      throw e;
+    });
   }
-  return cachedAdapter;
+  return adapterPromise;
+}
+
+/* ─────────────── Teams ─────────────── */
+
+// A team is a board. Every content item belongs to exactly one team, and a user
+// sees a board only by being a member of its team — being on two teams means
+// seeing both boards and nothing else.
+//
+// Enforcement is entirely server-side, in the API routes: every read and write
+// of an item first checks membership of that item's team. The team switcher in
+// the UI is a convenience, never a control.
+//
+// Administrators are not exempt. An admin can add themselves to any team in a
+// click, so nothing is out of reach, but an admin who is not a member of a team
+// does not see its board — which is what "one team cannot view another team's
+// records" has to mean to be worth anything.
+
+/** The team every pre-teams row is adopted into. Underscores cannot collide
+ *  with generateId(), which is why ORG_CONNECTION_ID uses the same trick. */
+export const DEFAULT_TEAM_ID = "__default__";
+const DEFAULT_TEAM_NAME = "General";
+
+export interface TeamRow {
+  id: string;
+  name: string;
+  createdAt: string | null;
+  updatedAt: string | null;
+}
+
+function rowToTeam(row: any): TeamRow {
+  return {
+    id: row.id,
+    name: row.name,
+    createdAt: row.created_at ?? null,
+    updatedAt: row.updated_at ?? null,
+  };
+}
+
+/** Trim and validate a team name. Returns an error message, or null if OK. */
+export function teamNameProblem(name: unknown): string | null {
+  if (typeof name !== "string") return "Team name is required.";
+  const value = name.trim();
+  if (value.length < 2) return "Team name must be at least 2 characters.";
+  if (value.length > 120) return "Team name must be 120 characters or fewer.";
+  return null;
+}
+
+/**
+ * Bring a database that predates teams — or one restored from a backup that
+ * does — up to the teams model, and do nothing at all to one that is already
+ * there.
+ *
+ * Runs on every adapter start and at the end of every restore, so it must stay
+ * idempotent and cheap.
+ */
+async function backfillTeams(run: RunFn): Promise<void> {
+  const anyTeam = await run("SELECT id FROM teams", [], true);
+  if (anyTeam.length > 0) {
+    // Teams already exist. Deliberately no repair pass here: if the default
+    // team was deleted on purpose, re-creating it on the next request would
+    // undo an administrator's decision.
+    return;
+  }
+
+  const now = new Date().toISOString();
+  await run(
+    "INSERT INTO teams (id, created_at, updated_at, name) VALUES (?, ?, ?, ?)",
+    [DEFAULT_TEAM_ID, now, now, DEFAULT_TEAM_NAME],
+    false
+  );
+
+  // Everyone who already had an account keeps seeing everything they saw
+  // before the upgrade: one team, and all of them on it.
+  const users = await run("SELECT id FROM users", [], true);
+  for (const user of users) {
+    await run(
+      "INSERT INTO team_members (id, team_id, user_id, created_at) VALUES (?, ?, ?, ?)",
+      [generateId(), DEFAULT_TEAM_ID, user.id, now],
+      false
+    );
+  }
+
+  // Every item, not just the ones with a NULL team. This branch only runs when
+  // the teams table is empty, and with no teams in existence every team_id is
+  // dangling by definition — a row pointing at a team that is not there is as
+  // invisible as one pointing at nothing.
+  await run("UPDATE content_items SET team_id = ?", [DEFAULT_TEAM_ID], false);
+}
+
+export async function listTeams(): Promise<TeamRow[]> {
+  const db = await getAdapter();
+  const rows = await db.run("SELECT * FROM teams ORDER BY name ASC", [], true);
+  return rows.map(rowToTeam);
+}
+
+export async function findTeamById(id: string): Promise<TeamRow | null> {
+  const db = await getAdapter();
+  const rows = await db.run("SELECT * FROM teams WHERE id = ?", [id], true);
+  return rows[0] ? rowToTeam(rows[0]) : null;
+}
+
+/** Teams the user belongs to, in the order the switcher shows them. */
+export async function listTeamsForUser(userId: string): Promise<TeamRow[]> {
+  const db = await getAdapter();
+  const rows = await db.run(
+    `SELECT t.* FROM teams t
+       JOIN team_members m ON m.team_id = t.id
+      WHERE m.user_id = ?
+      ORDER BY t.name ASC`,
+    [userId],
+    true
+  );
+  return rows.map(rowToTeam);
+}
+
+/**
+ * The single check every item read and write goes through.
+ *
+ * Takes a possibly-null team id because an item restored from an old backup can
+ * still be waiting for its backfill; no team means no access.
+ */
+export async function isTeamMember(
+  userId: string,
+  teamId: string | null | undefined
+): Promise<boolean> {
+  if (!teamId) return false;
+  const db = await getAdapter();
+  const rows = await db.run(
+    "SELECT id FROM team_members WHERE user_id = ? AND team_id = ?",
+    [userId, teamId],
+    true
+  );
+  return rows.length > 0;
+}
+
+/** Team ids for each of the given users, keyed by user id. */
+export async function teamIdsByUser(): Promise<Record<string, string[]>> {
+  const db = await getAdapter();
+  const rows = await db.run(
+    "SELECT user_id, team_id FROM team_members",
+    [],
+    true
+  );
+  const out: Record<string, string[]> = {};
+  for (const row of rows) {
+    (out[row.user_id] ??= []).push(row.team_id);
+  }
+  return out;
+}
+
+export async function memberIdsByTeam(): Promise<Record<string, string[]>> {
+  const db = await getAdapter();
+  const rows = await db.run(
+    "SELECT user_id, team_id FROM team_members",
+    [],
+    true
+  );
+  const out: Record<string, string[]> = {};
+  for (const row of rows) {
+    (out[row.team_id] ??= []).push(row.user_id);
+  }
+  return out;
+}
+
+export async function countItemsInTeam(teamId: string): Promise<number> {
+  const db = await getAdapter();
+  const rows = await db.run(
+    "SELECT COUNT(*) AS n FROM content_items WHERE team_id = ?",
+    [teamId],
+    true
+  );
+  return Number(rows[0]?.n ?? rows[0]?.count ?? 0);
+}
+
+/** Reject a duplicate name, matched the way a person would read it. */
+async function teamNameTaken(name: string, exceptId?: string): Promise<boolean> {
+  const wanted = name.trim().toLowerCase();
+  const teams = await listTeams();
+  return teams.some(
+    (t) => t.id !== exceptId && t.name.trim().toLowerCase() === wanted
+  );
+}
+
+export async function insertTeam(name: string): Promise<TeamRow> {
+  const db = await getAdapter();
+  const clean = name.trim();
+  if (await teamNameTaken(clean)) {
+    throw new Error(`There is already a team called "${clean}".`);
+  }
+
+  const id = generateId();
+  const now = new Date().toISOString();
+  await db.run(
+    "INSERT INTO teams (id, created_at, updated_at, name) VALUES (?, ?, ?, ?)",
+    [id, now, now, clean],
+    false
+  );
+
+  const created = await findTeamById(id);
+  if (!created) throw new Error("Failed to create the team.");
+  return created;
+}
+
+export async function renameTeam(id: string, name: string): Promise<TeamRow | null> {
+  const db = await getAdapter();
+  const existing = await findTeamById(id);
+  if (!existing) return null;
+
+  const clean = name.trim();
+  if (await teamNameTaken(clean, id)) {
+    throw new Error(`There is already a team called "${clean}".`);
+  }
+
+  await db.run(
+    "UPDATE teams SET name = ?, updated_at = ? WHERE id = ?",
+    [clean, new Date().toISOString(), id],
+    false
+  );
+  return findTeamById(id);
+}
+
+/** Replace a team's membership wholesale with the given user ids. */
+export async function setTeamMembers(
+  teamId: string,
+  userIds: string[]
+): Promise<void> {
+  const db = await getAdapter();
+  const wanted = [...new Set(userIds)];
+  const now = new Date().toISOString();
+
+  return db.transaction(async (run) => {
+    const current = await run(
+      "SELECT user_id FROM team_members WHERE team_id = ?",
+      [teamId],
+      true
+    );
+    const have = new Set(current.map((r: any) => r.user_id));
+
+    for (const userId of wanted) {
+      if (have.has(userId)) continue;
+      await run(
+        "INSERT INTO team_members (id, team_id, user_id, created_at) VALUES (?, ?, ?, ?)",
+        [generateId(), teamId, userId, now],
+        false
+      );
+    }
+    for (const userId of have) {
+      if (wanted.includes(userId as string)) continue;
+      await run(
+        "DELETE FROM team_members WHERE team_id = ? AND user_id = ?",
+        [teamId, userId],
+        false
+      );
+    }
+  });
+}
+
+/** Replace one user's team list wholesale. Mirrors setTeamMembers. */
+export async function setUserTeams(userId: string, teamIds: string[]): Promise<void> {
+  const db = await getAdapter();
+  const wanted = [...new Set(teamIds)];
+  const now = new Date().toISOString();
+
+  return db.transaction(async (run) => {
+    const current = await run(
+      "SELECT team_id FROM team_members WHERE user_id = ?",
+      [userId],
+      true
+    );
+    const have = new Set(current.map((r: any) => r.team_id));
+
+    for (const teamId of wanted) {
+      if (have.has(teamId)) continue;
+      await run(
+        "INSERT INTO team_members (id, team_id, user_id, created_at) VALUES (?, ?, ?, ?)",
+        [generateId(), teamId, userId, now],
+        false
+      );
+    }
+    for (const teamId of have) {
+      if (wanted.includes(teamId as string)) continue;
+      await run(
+        "DELETE FROM team_members WHERE team_id = ? AND user_id = ?",
+        [teamId, userId],
+        false
+      );
+    }
+  });
+}
+
+/**
+ * Delete a team, its memberships, and — only when asked — its items.
+ *
+ * `deleteItems` is not a convenience flag. A team's board is invisible to
+ * everyone once the team is gone, so deleting a populated team silently would
+ * strand the content rather than remove it; the caller has to say which it
+ * means.
+ */
+export async function deleteTeam(
+  id: string,
+  deleteItems: boolean
+): Promise<{ deletedItems: number }> {
+  const db = await getAdapter();
+  return db.transaction(async (run) => {
+    let deletedItems = 0;
+    if (deleteItems) {
+      const rows = await run(
+        "SELECT COUNT(*) AS n FROM content_items WHERE team_id = ?",
+        [id],
+        true
+      );
+      deletedItems = Number(rows[0]?.n ?? rows[0]?.count ?? 0);
+      await run("DELETE FROM content_items WHERE team_id = ?", [id], false);
+    }
+    await run("DELETE FROM team_members WHERE team_id = ?", [id], false);
+    await run("DELETE FROM teams WHERE id = ?", [id], false);
+    return { deletedItems };
+  });
 }
 
 /* ─────────────── Public data operations ─────────────── */
 
-export async function listItems(): Promise<any[]> {
+// Every item query is scoped by team. There is deliberately no "list all items"
+// function: an unscoped SELECT is one careless call site away from being the
+// hole this whole feature exists to close.
+
+export async function listItems(teamId: string): Promise<any[]> {
   const db = await getAdapter();
   const rows = await db.run(
-    "SELECT * FROM content_items ORDER BY created_at DESC",
-    [],
+    "SELECT * FROM content_items WHERE team_id = ? ORDER BY created_at DESC",
+    [teamId],
     true
   );
   return rows.map(rowToItem);
@@ -667,14 +1034,17 @@ export async function getItem(id: string): Promise<any | null> {
   return rows[0] ? rowToItem(rows[0]) : null;
 }
 
-export async function createItem(data: any): Promise<any> {
+export async function createItem(data: any, teamId: string): Promise<any> {
   const db = await getAdapter();
   const id = generateId();
   const now = new Date().toISOString();
   await db.run(
-    `INSERT INTO content_items (${COLUMNS.join(", ")})
-     VALUES (${COLUMNS.map(() => "?").join(", ")})`,
+    `INSERT INTO content_items (${COLUMNS.join(", ")}, team_id)
+     VALUES (${COLUMNS.map(() => "?").join(", ")}, ?)`,
     // Built from the same list as COLUMNS, so the two cannot fall out of step.
+    // team_id is appended rather than being an ITEM_FIELD on purpose: keeping it
+    // out of that list keeps it out of the CSV and out of ITEM_FIELD_MAP, so no
+    // import and no PATCH body can move an item into another team's board.
     [
       id,
       now,
@@ -684,6 +1054,7 @@ export async function createItem(data: any): Promise<any> {
           ? data.contentStatus ?? "Brainstormed"
           : data[field.key] ?? null
       ),
+      teamId,
     ],
     false
   );
@@ -772,14 +1143,24 @@ export async function countUsers(): Promise<number> {
   return Number(rows[0]?.n ?? rows[0]?.count ?? 0);
 }
 
-export async function listUsers(): Promise<UserRow[]> {
+export interface UserWithTeams extends UserRow {
+  teamIds: string[];
+}
+
+/** Every account, each with the teams it belongs to. Admin-only, by its caller. */
+export async function listUsers(): Promise<UserWithTeams[]> {
   const db = await getAdapter();
   const rows = await db.run(
     "SELECT * FROM users ORDER BY created_at ASC",
     [],
     true
   );
-  return rows.map(rowToUser);
+  // One extra query rather than one per user: this list is rendered whole.
+  const byUser = await teamIdsByUser();
+  return rows.map((row) => ({
+    ...rowToUser(row),
+    teamIds: byUser[row.id] ?? [],
+  }));
 }
 
 export async function findUserById(id: string): Promise<UserWithHash | null> {
@@ -807,6 +1188,8 @@ export async function insertUser(data: {
   passwordHash: string;
   role: Role;
   displayName?: string | null;
+  /** Teams the new account joins. An account with none has no board to see. */
+  teamIds?: string[];
 }): Promise<UserRow> {
   const db = await getAdapter();
   const username = normalizeUsername(data.username);
@@ -823,6 +1206,8 @@ export async function insertUser(data: {
     [id, now, now, username, data.displayName ?? null, data.passwordHash, data.role],
     false
   );
+
+  if (data.teamIds?.length) await setUserTeams(id, data.teamIds);
 
   const created = await findUserById(id);
   if (!created) throw new Error("Failed to create user.");
@@ -869,8 +1254,11 @@ export async function deleteUser(id: string): Promise<boolean> {
   const existing = await findUserById(id);
   if (!existing) return false;
   await db.run("DELETE FROM sessions WHERE user_id = ?", [id], false);
-  // Real user ids never equal ORG_CONNECTION_ID, so the team default survives.
+  // Real user ids never equal ORG_CONNECTION_ID, so the org default survives.
   await db.run("DELETE FROM llm_connections WHERE user_id = ?", [id], false);
+  // Memberships go with the account. Left behind they would readmit whoever
+  // happened to be issued the same id later — and clutter every member list.
+  await db.run("DELETE FROM team_members WHERE user_id = ?", [id], false);
   await db.run("DELETE FROM users WHERE id = ?", [id], false);
   return true;
 }
@@ -1277,6 +1665,11 @@ export async function restoreSqlBackup(parsed: ParsedBackup): Promise<RestoreRes
         total++;
       }
     }
+
+    // A backup taken before teams existed carries no teams and no memberships,
+    // so without this the restored board would belong to no one and be visible
+    // to no one. Same adoption the first post-upgrade start performs.
+    await backfillTeams(run);
 
     return { inserted, total };
   });

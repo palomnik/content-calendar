@@ -23,6 +23,8 @@ import {
   findSession,
   findUserById,
   insertSession,
+  isTeamMember,
+  listTeamsForUser,
   publicUser,
   purgeExpiredSessions,
   Role,
@@ -198,6 +200,81 @@ export async function requireAdmin(req?: NextRequest): Promise<Guard> {
     return deny(403, "Administrator access required.");
   }
   return auth;
+}
+
+/* ─────────────── Team access ─────────────── */
+
+// A board is a team. Everything an item route does — read, create, edit,
+// delete, generate against — passes through one of these two checks first.
+//
+// Being an administrator grants no access to a board. Admins manage teams and
+// can put themselves on any of them, so nothing is unreachable, but "I am an
+// admin" is not by itself an answer to "may I read this team's content".
+
+export type TeamGuard =
+  | { teamId: string; error: null }
+  | { teamId: null; error: NextResponse };
+
+/**
+ * Resolve which team a request acts on.
+ *
+ * An explicit team must be one the caller belongs to. With none named, the
+ * caller's first team stands in, so a client that has not yet loaded the team
+ * list still lands somewhere sensible instead of failing.
+ */
+export async function requireTeam(
+  userId: string,
+  requested: string | null | undefined
+): Promise<TeamGuard> {
+  if (requested) {
+    if (!(await isTeamMember(userId, requested))) {
+      // 403 rather than 404: the caller named this team themselves, so
+      // confirming it exists tells them nothing they did not already supply.
+      return {
+        teamId: null,
+        error: NextResponse.json(
+          { error: "You are not a member of that team." },
+          { status: 403 }
+        ),
+      };
+    }
+    return { teamId: requested, error: null };
+  }
+
+  const teams = await listTeamsForUser(userId);
+  if (teams.length === 0) {
+    return {
+      teamId: null,
+      error: NextResponse.json(
+        {
+          error:
+            "You are not a member of any team yet. Ask an administrator to add you to one.",
+        },
+        { status: 403 }
+      ),
+    };
+  }
+  return { teamId: teams[0].id, error: null };
+}
+
+/**
+ * Guard access to one existing item.
+ *
+ * Returns 404, not 403, when the item belongs to a team the caller is not on.
+ * A 403 would confirm the id is real, turning the item endpoints into an
+ * oracle for what other teams are working on — the exact thing team boards are
+ * meant to prevent.
+ */
+export function itemNotFound(): NextResponse {
+  return NextResponse.json({ error: "Not found" }, { status: 404 });
+}
+
+export async function canReachItem(
+  userId: string,
+  item: { teamId?: string | null } | null
+): Promise<boolean> {
+  if (!item) return false;
+  return isTeamMember(userId, item.teamId);
 }
 
 /* ─────────────── First-run setup ─────────────── */

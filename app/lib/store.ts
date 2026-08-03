@@ -19,8 +19,15 @@ import {
 } from "./sqlite";
 
 export interface ItemStore {
-  getAll(): Promise<any[]>;
-  create(data: any): Promise<any>;
+  /**
+   * Items on one team's board.
+   *
+   * The team id is passed on every read and create because the live board is
+   * per-team. Test mode has no teams — there is no account and no database to
+   * partition — so its store takes the argument and ignores it.
+   */
+  getAll(teamId: string | null): Promise<any[]>;
+  create(data: any, teamId: string | null): Promise<any>;
   update(id: string, data: any): Promise<any>;
   remove(id: string): Promise<void>;
   /** Whether AI features should be offered. */
@@ -36,8 +43,8 @@ export interface ItemStore {
 /* ─────────────── Live: the database, via the API ─────────────── */
 
 export const liveStore: ItemStore = {
-  getAll: () => getAllItems(),
-  create: (data) => createItem(data),
+  getAll: (teamId) => getAllItems(teamId),
+  create: (data, teamId) => createItem(data, teamId),
   update: (id, data) => updateItem(id, data),
   remove: (id) => deleteItem(id),
   llmConfigured: async () => (await getLlmStatus()).configured,

@@ -1,8 +1,14 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getItem, updateItem, deleteItem } from "../../../lib/db";
-import { requireUser } from "../../../lib/auth";
+import { canReachItem, itemNotFound, requireUser } from "../../../lib/auth";
 
-// GET /api/items/[id] — get single item
+// Every handler here loads the item first and checks the caller's membership of
+// that item's team before doing anything with it. A non-member gets the same
+// 404 as a made-up id — see itemNotFound() for why that matters.
+//
+// Note there is no path to move an item between teams: updateItem writes only
+// the fields in ITEM_FIELD_MAP, and team_id is deliberately not one of them.
+
 export async function GET(
   req: NextRequest,
   { params }: { params: Promise<{ id: string }> }
@@ -13,9 +19,8 @@ export async function GET(
 
     const { id } = await params;
     const item = await getItem(id);
-    if (!item) {
-      return NextResponse.json({ error: "Not found" }, { status: 404 });
-    }
+    if (!(await canReachItem(auth.user.id, item))) return itemNotFound();
+
     return NextResponse.json(item);
   } catch (e: any) {
     return NextResponse.json({ error: e.message }, { status: 500 });
@@ -32,11 +37,12 @@ export async function PATCH(
     if (auth.error) return auth.error;
 
     const { id } = await params;
+    const existing = await getItem(id);
+    if (!(await canReachItem(auth.user.id, existing))) return itemNotFound();
+
     const data = await req.json();
     const item = await updateItem(id, data);
-    if (!item) {
-      return NextResponse.json({ error: "Not found" }, { status: 404 });
-    }
+    if (!item) return itemNotFound();
     return NextResponse.json(item);
   } catch (e: any) {
     return NextResponse.json({ error: e.message }, { status: 500 });
@@ -53,10 +59,12 @@ export async function DELETE(
     if (auth.error) return auth.error;
 
     const { id } = await params;
+    const existing = await getItem(id);
+    if (!(await canReachItem(auth.user.id, existing))) return itemNotFound();
+
     const ok = await deleteItem(id);
-    if (!ok) {
-      return NextResponse.json({ error: "Not found" }, { status: 404 });
-    }
+    if (!ok) return itemNotFound();
+
     return NextResponse.json({ success: true, deleted: id });
   } catch (e: any) {
     return NextResponse.json({ error: e.message }, { status: 500 });

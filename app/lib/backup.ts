@@ -33,7 +33,20 @@ export const BACKUP_TABLES: { name: string; columns: string[] }[] = [
       "role",
     ],
   },
-  { name: "content_items", columns: ITEM_COLUMNS },
+  // Teams before memberships, and both before items, so the file reads in
+  // dependency order even though nothing here declares a foreign key.
+  {
+    name: "teams",
+    columns: ["id", "created_at", "updated_at", "name"],
+  },
+  {
+    name: "team_members",
+    columns: ["id", "team_id", "user_id", "created_at"],
+  },
+  // team_id is appended rather than living in ITEM_FIELDS, which is what keeps
+  // it out of the CSV — a board is a permission boundary, not a spreadsheet
+  // column someone can retype. A backup still has to carry it.
+  { name: "content_items", columns: [...ITEM_COLUMNS, "team_id"] },
   {
     name: "llm_connections",
     columns: [

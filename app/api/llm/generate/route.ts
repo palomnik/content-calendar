@@ -13,7 +13,7 @@
 // leaving half-generated text in someone's notes.
 
 import { NextRequest, NextResponse } from "next/server";
-import { requireUser } from "../../../lib/auth";
+import { canReachItem, requireUser } from "../../../lib/auth";
 import { getItem } from "../../../lib/db";
 import { generateStream } from "../../../lib/llm";
 import { buildDraftPrompt, buildOutlinePrompt } from "../../../lib/prompts";
@@ -32,7 +32,10 @@ export async function POST(req: NextRequest) {
     const task: "outline" | "draft" = body?.task === "draft" ? "draft" : "outline";
 
     const item = await getItem(String(body?.itemId ?? ""));
-    if (!item) {
+    // The item's whole text is about to be sent to a model and streamed back,
+    // so this route reads content just as much as /api/items/[id] does and
+    // needs the same membership check.
+    if (!(await canReachItem(auth.user.id, item))) {
       return NextResponse.json({ error: "Not found" }, { status: 404 });
     }
 
