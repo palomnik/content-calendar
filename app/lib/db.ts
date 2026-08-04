@@ -32,11 +32,11 @@ export type Provider = "sqlite" | "mysql" | "mariadb" | "postgres";
 
 // How to treat TLS on the connection. Mirrors libpq's sslmode semantics, which
 // is what every managed provider documents:
-//   disable — plain TCP. Only sane for localhost.
+//   disable — plain TCP. Only sane on a private network.
 //   require — encrypt, but do not verify the server certificate.
 //   verify  — encrypt and verify the certificate against the trust store.
 // Managed providers (Neon, Supabase, RDS) reject unencrypted connections, so
-// anything not on localhost needs at least "require".
+// anything on a public host needs at least "require". See isPrivateHost.
 export type SslMode = "disable" | "require" | "verify";
 
 export interface DbConnection {
@@ -81,8 +81,27 @@ const PROVIDER_BY_SCHEME: Record<string, Provider> = {
 // convention; POSTGRES_URL is what Vercel's Neon/Postgres integration injects.
 const URL_VARS = ["DATABASE_URL", "POSTGRES_URL"];
 
-function isLocalHost(host: string): boolean {
-  return host === "localhost" || host === "127.0.0.1" || host === "::1";
+// Hosts we assume are reachable only over a trusted network, and therefore
+// default to plain TCP. Managed providers always hand out a public FQDN, so
+// requiring a dot is what separates "Neon" from "the Postgres container next
+// to us". Covers loopback, container/service names (Docker Compose, Coolify,
+// Kubernetes short names), the .internal/.local suffixes, and RFC 1918 /
+// unique-local addresses.
+function isPrivateHost(host: string): boolean {
+  const h = host.trim().toLowerCase().replace(/^\[|\]$/g, "");
+  if (h === "localhost" || h === "127.0.0.1" || h === "::1") return true;
+  // No dot at all: a container or service name on an internal network.
+  if (!h.includes(".")) return true;
+  if (/\.(internal|local|localdomain)$/.test(h)) return true;
+  // RFC 1918 private ranges, plus the rest of the loopback /8.
+  if (/^10\./.test(h)) return true;
+  if (/^192\.168\./.test(h)) return true;
+  if (/^172\.(1[6-9]|2\d|3[01])\./.test(h)) return true;
+  if (/^127\./.test(h)) return true;
+  // IPv6 unique-local (fc00::/7) and link-local (fe80::/10).
+  if (/^f[cd][0-9a-f]{2}:/.test(h)) return true;
+  if (/^fe[89ab][0-9a-f]:/.test(h)) return true;
+  return false;
 }
 
 function parseSslMode(raw: string | null | undefined, host: string): SslMode {
@@ -102,8 +121,9 @@ function parseSslMode(raw: string | null | undefined, host: string): SslMode {
     throw new Error(`Unrecognised SSL mode: ${raw}`);
   }
   // No explicit mode: managed databases are remote and always want TLS, but
-  // a local Postgres in Docker generally has none configured.
-  return isLocalHost(host) ? "disable" : "require";
+  // a Postgres container on a private network generally has none configured,
+  // and pg aborts the handshake outright when the server answers "no SSL".
+  return isPrivateHost(host) ? "disable" : "require";
 }
 
 // Parse a connection URL such as

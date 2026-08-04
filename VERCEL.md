@@ -250,7 +250,9 @@ than the one you are hitting, or you have not redeployed since adding it.
 **`The server does not support SSL connections`**
 Your connection string says `sslmode=require` but the database has TLS off.
 That is normal for a self-hosted Postgres on a private network — use
-`?sslmode=disable`. Never do this over the public internet.
+`?sslmode=disable`. Never do this over the public internet. Private hosts are
+detected automatically (see `DB_SSL` below), so this should only appear when
+`sslmode=require` was set explicitly.
 
 **`self-signed certificate`**
 You used `sslmode=verify` against a database with a self-signed certificate.
@@ -285,7 +287,7 @@ must be percent-encoded (`@` → `%40`, `/` → `%2F`).
 | `POSTGRES_URL` | Fallback name, read only if `DATABASE_URL` is unset. Set by Vercel's Neon integration. |
 | `DB_PROVIDER` | `sqlite`, `mysql`, `mariadb`, or `postgres`. Alternative to a URL. |
 | `DB_HOST` / `DB_PORT` / `DB_NAME` / `DB_USER` / `DB_PASSWORD` | Discrete connection fields, used with `DB_PROVIDER`. |
-| `DB_SSL` | `disable`, `require`, or `verify`. Defaults to `require` for remote hosts, `disable` for localhost. |
+| `DB_SSL` | `disable`, `require`, or `verify`. Defaults to `disable` for private hosts and `require` everywhere else. Private means loopback, a bare service/container name with no dot (Docker Compose, Coolify, Kubernetes), a `.internal`/`.local` suffix, or an RFC 1918 / unique-local address. |
 | `DB_POOL_MAX` | Connections per instance. Defaults to 2 on Vercel, 5 elsewhere. |
 | `SETUP_TOKEN` | Shared secret required during first-run admin setup. |
 
