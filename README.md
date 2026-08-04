@@ -8,8 +8,9 @@ It is advisable to do the workshop and course to get most use out of the app, bu
 
 Use or install the app in one of 3 ways.
 1. Just use the test mode as needed without saving data, except as a CSV export. [Access the test mode here](https://cc.app.jshypertext.com).
-2. Install your own instance on your server from this repository – it’s open source! 
-3. Get it installed in your own app server, which I can build for you. [Learn more here](https://johnsimmonshypertext.com/hosting-and-help/concierge-app-development-hosting/).
+2. Get a private online team account for a team up to 10 – [Subscribe Here](https://link.fastpaydirect.com/payment-link/6a7126f7a655fa0b802a7c9d).
+3. Install your own instance on your server from this repository – it’s open source! 
+4. Get it installed in your own app server, which I can build for you. [Learn more here](https://johnsimmonshypertext.com/hosting-and-help/concierge-app-development-hosting/).
 
 ## License
 
