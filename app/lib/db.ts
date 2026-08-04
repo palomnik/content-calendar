@@ -87,7 +87,7 @@ const URL_VARS = ["DATABASE_URL", "POSTGRES_URL"];
 // to us". Covers loopback, container/service names (Docker Compose, Coolify,
 // Kubernetes short names), the .internal/.local suffixes, and RFC 1918 /
 // unique-local addresses.
-function isPrivateHost(host: string): boolean {
+export function isPrivateHost(host: string): boolean {
   const h = host.trim().toLowerCase().replace(/^\[|\]$/g, "");
   if (h === "localhost" || h === "127.0.0.1" || h === "::1") return true;
   // No dot at all: a container or service name on an internal network.
@@ -102,6 +102,34 @@ function isPrivateHost(host: string): boolean {
   if (/^f[cd][0-9a-f]{2}:/.test(h)) return true;
   if (/^fe[89ab][0-9a-f]:/.test(h)) return true;
   return false;
+}
+
+/**
+ * Reject a value that is a whole connection string rather than a hostname.
+ *
+ * Pasting the full URL into a host field is the single easiest mistake to
+ * make, and the driver's only complaint is `getaddrinfo ENOTFOUND
+ * postgres://user:pass@host:5432/db` — which buries the answer in what looks
+ * like a DNS problem, and echoes the password into the logs while doing it.
+ * Returns a message to show the operator, or null when the host is fine.
+ */
+export function hostProblem(host: string): string | null {
+  const h = host.trim();
+  if (!h) return "Host is required.";
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(h)) {
+    return (
+      "That is a full connection string, not a hostname. Either set it as " +
+      "DATABASE_URL on its own, or enter just the host part here " +
+      "(the text between @ and :port)."
+    );
+  }
+  if (h.includes("@") || h.includes("/")) {
+    return (
+      "A host may not contain @ or /. Enter only the hostname, and put the " +
+      "user, password, and database name in their own fields."
+    );
+  }
+  return null;
 }
 
 function parseSslMode(raw: string | null | undefined, host: string): SslMode {
@@ -192,6 +220,9 @@ function parseDiscreteEnv(): DbConfig | null {
       `DB_PROVIDER=${provider} requires ${missing.join(", ")} to also be set.`
     );
   }
+
+  const problem = hostProblem(host!);
+  if (problem) throw new Error(`DB_HOST is invalid. ${problem}`);
 
   return {
     provider,

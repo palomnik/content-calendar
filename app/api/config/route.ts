@@ -3,6 +3,8 @@ import {
   DbConfig,
   Provider,
   SslMode,
+  hostProblem,
+  isPrivateHost,
   publicConfig,
   readConfig,
   testConfig,
@@ -29,6 +31,9 @@ function normalize(body: any): DbConfig {
     throw new Error("Host, database, and user are required.");
   }
 
+  const problem = hostProblem(String(c.host));
+  if (problem) throw new Error(problem);
+
   // The stored config, but only when it describes the same target — otherwise
   // we would leak one database's password into a connection to another.
   const current = readConfig();
@@ -54,11 +59,9 @@ function normalize(body: any): DbConfig {
   } else if (sameTarget?.ssl) {
     ssl = sameTarget.ssl;
   } else {
-    // Nothing to go on: remote databases require TLS, a local one has none.
-    const host = String(c.host);
-    const local =
-      host === "localhost" || host === "127.0.0.1" || host === "::1";
-    ssl = local ? "disable" : "require";
+    // Nothing to go on: public databases require TLS, one on a private
+    // network has none. Same rule the env-var path uses — see isPrivateHost.
+    ssl = isPrivateHost(String(c.host)) ? "disable" : "require";
   }
 
   return {
