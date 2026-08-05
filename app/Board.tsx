@@ -5,6 +5,7 @@ import Link from "next/link";
 import { MAX_CONTEXT_FILE_CHARS } from "./lib/fields";
 import { exportCsv, parseCsv, browserDownload, getMyTeams, Team } from "./lib/sqlite";
 import { buildIcs, countIcsEvents } from "./lib/ics";
+import { buildOrg } from "./lib/orgmode";
 import { clearTestSession, liveStore, testStore } from "./lib/store";
 import { leaveTo, signOut, useAuth } from "./lib/useAuth";
 import MonthCalendar from "./MonthCalendar";
@@ -1025,6 +1026,21 @@ export default function Board({ testMode = false }: { testMode?: boolean }) {
     }
   };
 
+  // Like the .ics export, this takes every item rather than the search
+  // matches: an agenda file truncated by a stray search term would be a
+  // nasty surprise.
+  const handleExportOrg = () => {
+    try {
+      const org = buildOrg(items);
+      const fileName = `content_calendar-${new Date().toISOString().slice(0, 10)}.org`;
+      browserDownload(org, fileName, "text/plain;charset=utf-8");
+      show("Org file exported", "success");
+    } catch (e: any) {
+      setError(String(e));
+      show("Org export failed", "error");
+    }
+  };
+
   const handleImportCsv = async (csvText: string) => {
     try {
       const rows = parseCsv(csvText);
@@ -1258,6 +1274,14 @@ export default function Board({ testMode = false }: { testMode?: boolean }) {
           >
             <span className="hidden md:inline">Export CSV</span>
             <span className="md:hidden">📤</span>
+          </button>
+          <button
+            onClick={handleExportOrg}
+            className="rounded-lg border border-[var(--border)] px-2.5 py-2 text-sm font-medium text-[var(--foreground)] transition hover:bg-[var(--surface)] active:bg-[var(--surface-hover)] md:px-3"
+            title="Export every item's title and due date as an Org mode file"
+          >
+            <span className="hidden md:inline">Export Org</span>
+            <span className="md:hidden">🗒</span>
           </button>
           <button
             onClick={() => setShowImport(true)}
